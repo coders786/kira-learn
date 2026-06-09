@@ -1,38 +1,73 @@
-// ===== Gemini Speech-to-Text Engine =====
-// Inspired by Wispr Flow's approach: capture audio, send to AI for transcription
-// Instead of browser's SpeechRecognition (which hallucinates in noise),
-// we use Gemini's audio understanding for accurate, context-aware transcription.
+// ===== Gemini Speech-to-Text Engine v2 =====
+// FIX: Gemini generateContent API does NOT support WebM audio.
+// Supported formats: WAV, MP3, AIFF, AAC, OGG, FLAC
+//
+// Solution: Capture raw PCM via AudioContext → encode as WAV → send to Gemini
+// This is the exact approach used by Whisper Flow and Gemini Live API docs.
 //
 // Pipeline:
-// 1. getUserMedia → microphone stream
-// 2. MediaRecorder → audio chunks (webm/opus)
-// 3. AudioContext + AnalyserNode → Voice Activity Detection (VAD)
-// 4. When speech ends (silence after speech) → compile audio blob
-// 5. Send to Gemini API → get accurate transcription
-// 6. If no speech detected (just noise) → return empty string
-//
-// Why Gemini instead of Web Speech API:
-// - Gemini is context-aware (we pass conversation context)
-// - Gemini doesn't hallucinate words in noise
-// - Gemini handles accents, slang, technical terms
-// - Gemini can self-correct and format output
+// 1. getUserMedia → mic stream (mono, 16kHz)
+// 2. AudioContext + ScriptProcessorNode → raw PCM Float32 samples
+// 3. AnalyserNode → VAD (voice activity detection)
+// 4. On speech end → convert Float32 samples to 16-bit PCM WAV
+// 5. Send WAV (base64) to Gemini → accurate transcription
+// 6. Noise/silence → NO_SPEECH response → ignore
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export interface STTConfig {
   apiKey: string;
-  context?: string; // Recent conversation context for better transcription
-  language?: string; // Language hint
-  maxChunkDuration?: number; // Max recording duration before auto-send (ms)
-  silenceThreshold?: number; // Silence detection threshold (0-1)
-  silenceDuration?: number; // How long silence before processing (ms)
+  context?: string;
+  language?: string;
+  maxChunkDuration?: number;
+  silenceDuration?: number;
 }
 
 export interface STTResult {
   text: string;
   confidence: "high" | "medium" | "low";
-  duration: number; // Audio duration in ms
-  wasSpeech: boolean; // Whether actual speech was detected vs just noise
+  duration: number;
+  wasSpeech: boolean;
+}
+
+// ===== WAV encoder: raw PCM Float32 → 16-bit PCM WAV bytes =====
+function encodeWAV(samples: Float32Array, sampleRate: number): ArrayBuffer {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, "WAVE");
+
+  // fmt chunk
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);      // chunk size
+  view.setUint16(20, 1, true);       // PCM format
+  view.setUint16(22, 1, true);       // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);       // block align
+  view.setUint16(34, 16, true);      // bits per sample
+
+  // data chunk
+  writeString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  // Convert Float32 to Int16
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+
+  return buffer;
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
 }
 
 export class GeminiSTT {
@@ -40,12 +75,17 @@ export class GeminiSTT {
   private audioModel: any;
   private config: Required<STTConfig>;
 
-  // Audio capture state
+  // Audio capture
   private stream: MediaStream | null = null;
-  private mediaRecorder: MediaRecorder | null = null;
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
-  private chunks: Blob[] = [];
+  private processor: ScriptProcessorNode | null = null;
+  private source: MediaStreamAudioSourceNode | null = null;
+
+  // PCM sample buffer
+  private pcmBuffer: Float32Array[] = [];
+  private recordingBuffer: Float32Array[] = [];
+  private isActive = false;
 
   // VAD state
   private isSpeaking = false;
@@ -53,13 +93,12 @@ export class GeminiSTT {
   private speechStartTime = 0;
   private maxChunkTimer: ReturnType<typeof setTimeout> | null = null;
   private vadInterval: ReturnType<typeof setInterval> | null = null;
-  private isActive = false;
 
-  // Energy tracking for VAD
+  // Energy tracking
   private energyHistory: number[] = [];
-  private readonly ENERGY_HISTORY_SIZE = 10;
-  private readonly SPEECH_ENERGY_THRESHOLD = 0.015; // Tuned for typical mic
-  private readonly SILENCE_ENERGY_THRESHOLD = 0.008;
+  private readonly ENERGY_HISTORY_SIZE = 15;
+  private readonly BASE_SPEECH_THRESHOLD = 0.012;
+  private readonly BASE_SILENCE_THRESHOLD = 0.006;
 
   // Callbacks
   private onResult: ((result: STTResult) => void) | null = null;
@@ -69,33 +108,40 @@ export class GeminiSTT {
   // Processing lock
   private isProcessing = false;
 
+  // Debug
+  private debugLog: string[] = [];
+  private log(msg: string) {
+    const entry = `[GeminiSTT] ${msg}`;
+    this.debugLog.push(entry);
+    if (this.debugLog.length > 50) this.debugLog.shift();
+    console.log(entry);
+  }
+
   constructor(config: STTConfig) {
     this.config = {
       apiKey: config.apiKey,
       context: config.context || "",
       language: config.language || "en",
-      maxChunkDuration: config.maxChunkDuration || 15000, // 15s max before auto-send
-      silenceThreshold: config.silenceThreshold || 0.008,
-      silenceDuration: config.silenceDuration || 1500, // 1.5s silence = speech ended
+      maxChunkDuration: config.maxChunkDuration || 15000,
+      silenceDuration: config.silenceDuration || 1800,
     };
 
     this.genAI = new GoogleGenerativeAI(this.config.apiKey);
     this.audioModel = this.genAI.getGenerativeModel({
       model: "gemini-2.0-flash",
       generationConfig: {
-        temperature: 0.1, // Low temp for accurate transcription
+        temperature: 0.1,
         topP: 0.95,
         maxOutputTokens: 300,
       },
     });
   }
 
-  // ===== Set conversation context for better transcription =====
   setContext(context: string) {
     this.config.context = context;
   }
 
-  // ===== Start microphone + VAD =====
+  // ===== Start mic + VAD + PCM capture =====
   async start(
     onResult: (result: STTResult) => void,
     onSpeakingChange: (speaking: boolean) => void,
@@ -106,218 +152,226 @@ export class GeminiSTT {
     this.onError = onError;
 
     try {
-      // Get microphone access
+      this.log("Requesting microphone access...");
+
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
         },
       });
 
-      // Set up audio analysis for VAD
+      this.log("Got mic stream. Setting up AudioContext...");
+
+      // Create AudioContext at 16kHz for optimal Gemini transcription
       this.audioContext = new AudioContext({ sampleRate: 16000 });
-      const source = this.audioContext.createMediaStreamSource(this.stream);
+      this.source = this.audioContext.createMediaStreamSource(this.stream);
+
+      // Analyser for VAD
       this.analyser = this.audioContext.createAnalyser();
       this.analyser.fftSize = 512;
-      this.analyser.smoothingTimeConstant = 0.8;
-      source.connect(this.analyser);
+      this.analyser.smoothingTimeConstant = 0.85;
+      this.source.connect(this.analyser);
 
-      // Start recording
-      this.startRecording();
+      // ScriptProcessor to capture raw PCM samples
+      // bufferSize 4096 = ~256ms at 16kHz
+      this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+      this.processor.onaudioprocess = (e) => {
+        if (!this.isActive) return;
+        const input = e.inputBuffer.getChannelData(0);
+        // Copy the buffer (the original gets reused)
+        const copy = new Float32Array(input);
+        this.pcmBuffer.push(copy);
+
+        // Also accumulate into recording buffer
+        if (this.isSpeaking || this.recordingBuffer.length > 0) {
+          this.recordingBuffer.push(copy);
+        }
+      };
+      this.source.connect(this.processor);
+      this.processor.connect(this.audioContext.destination); // Must connect to destination
+
+      this.isActive = true;
+      this.log("Audio pipeline active. Starting VAD...");
 
       // Start VAD loop
-      this.isActive = true;
       this.startVAD();
+
+      // Max chunk timer
+      this.maxChunkTimer = setTimeout(() => {
+        this.log("Max chunk duration reached, processing...");
+        if (this.recordingBuffer.length > 0) {
+          this.processRecording();
+        }
+      }, this.config.maxChunkDuration);
 
       return true;
     } catch (error: any) {
-      console.error("[GeminiSTT] Start failed:", error);
+      this.log(`Start failed: ${error.message}`);
       onError(error);
       return false;
     }
   }
 
-  // ===== Start MediaRecorder =====
-  private startRecording() {
-    this.chunks = [];
-
-    // Use webm/opus for good quality and small size
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : MediaRecorder.isTypeSupported("audio/webm")
-        ? "audio/webm"
-        : "audio/ogg;codecs=opus";
-
-    this.mediaRecorder = new MediaRecorder(this.stream!, { mimeType });
-
-    this.mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        this.chunks.push(event.data);
-      }
-    };
-
-    this.mediaRecorder.start(200); // Collect chunks every 200ms
-
-    // Max chunk timer — auto-send after max duration
-    this.maxChunkTimer = setTimeout(() => {
-      if (this.chunks.length > 0) {
-        this.processAudio();
-      }
-    }, this.config.maxChunkDuration);
-  }
-
-  // ===== Voice Activity Detection loop =====
+  // ===== VAD loop =====
   private startVAD() {
     const dataArray = new Float32Array(this.analyser!.fftSize);
 
     this.vadInterval = setInterval(() => {
       if (!this.isActive || !this.analyser) return;
 
-      // Get audio energy (RMS)
       this.analyser.getFloatTimeDomainData(dataArray);
+
+      // Calculate RMS energy
       let sum = 0;
       for (let i = 0; i < dataArray.length; i++) {
         sum += dataArray[i] * dataArray[i];
       }
       const rms = Math.sqrt(sum / dataArray.length);
 
-      // Track energy history for adaptive threshold
+      // Track energy history
       this.energyHistory.push(rms);
       if (this.energyHistory.length > this.ENERGY_HISTORY_SIZE) {
         this.energyHistory.shift();
       }
 
-      // Calculate adaptive threshold based on ambient noise
+      // Adaptive threshold: learn the noise floor
       const avgEnergy = this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length;
-      const speechThreshold = Math.max(this.SPEECH_ENERGY_THRESHOLD, avgEnergy * 2.5);
-      const silenceThreshold = Math.max(this.SILENCE_ENERGY_THRESHOLD, avgEnergy * 1.5);
+      const speechThreshold = Math.max(this.BASE_SPEECH_THRESHOLD, avgEnergy * 3.0);
+      const silenceThreshold = Math.max(this.BASE_SILENCE_THRESHOLD, avgEnergy * 1.8);
 
       if (rms > speechThreshold) {
-        // Speech detected
         if (!this.isSpeaking) {
           this.isSpeaking = true;
           this.speechStartTime = Date.now();
           this.onSpeakingChange?.(true);
+          this.log(`Speech detected (rms=${rms.toFixed(4)}, threshold=${speechThreshold.toFixed(4)})`);
         }
-
-        // Clear silence timer (speech is ongoing)
+        // Clear silence timer
         if (this.silenceTimer) {
           clearTimeout(this.silenceTimer);
           this.silenceTimer = null;
         }
       } else if (this.isSpeaking && rms < silenceThreshold) {
-        // Silence after speech
         if (!this.silenceTimer) {
           this.silenceTimer = setTimeout(() => {
-            // Speech has ended — process audio
+            this.log(`Speech ended (silence ${this.config.silenceDuration}ms)`);
             this.isSpeaking = false;
             this.onSpeakingChange?.(false);
-            this.speechStartTime = 0;
 
-            if (this.chunks.length > 0) {
-              this.processAudio();
+            if (this.recordingBuffer.length > 0) {
+              this.processRecording();
             }
           }, this.config.silenceDuration);
         }
       }
-    }, 100); // Check every 100ms
+    }, 80);
   }
 
-  // ===== Process recorded audio through Gemini =====
-  private async processAudio() {
-    if (this.isProcessing) return;
+  // ===== Process accumulated recording =====
+  private async processRecording() {
+    if (this.isProcessing) {
+      this.log("Already processing, skipping");
+      return;
+    }
     this.isProcessing = true;
 
-    // Reset recording
-    const currentChunks = [...this.chunks];
-    this.chunks = [];
+    // Grab the buffer
+    const chunks = [...this.recordingBuffer];
+    this.recordingBuffer = [];
 
-    // Clear max chunk timer and restart
+    // Reset max chunk timer
     if (this.maxChunkTimer) {
       clearTimeout(this.maxChunkTimer);
       this.maxChunkTimer = null;
     }
-
-    // Restart recording for next utterance
-    if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
-      try { this.mediaRecorder.stop(); } catch {}
-    }
-    setTimeout(() => {
-      if (this.isActive && this.stream) {
-        this.startRecording();
+    // Restart max chunk timer
+    this.maxChunkTimer = setTimeout(() => {
+      if (this.recordingBuffer.length > 0) {
+        this.processRecording();
       }
-    }, 100);
+    }, this.config.maxChunkDuration);
 
-    if (currentChunks.length === 0) {
+    if (chunks.length === 0) {
       this.isProcessing = false;
       return;
     }
 
-    const audioDuration = Date.now() - (this.speechStartTime || Date.now());
+    // Merge all Float32 chunks into one
+    const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+    const merged = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    const audioDuration = (totalLength / 16000) * 1000; // ms
+    this.log(`Processing ${merged.length} samples (${audioDuration.toFixed(0)}ms)`);
+
+    // Skip very short audio (< 300ms) — probably just noise burst
+    if (audioDuration < 300) {
+      this.log("Too short, skipping");
+      this.isProcessing = false;
+      return;
+    }
 
     try {
-      // Compile audio blob
-      const mimeType = currentChunks[0].type || "audio/webm";
-      const audioBlob = new Blob(currentChunks, { type: mimeType });
+      // Encode as WAV
+      const wavBuffer = encodeWAV(merged, 16000);
+      const wavBase64 = this.arrayBufferToBase64(wavBuffer);
 
-      // Skip very short audio (< 300ms) — probably just noise
-      if (audioBlob.size < 1000) {
-        this.isProcessing = false;
-        return;
-      }
+      this.log(`WAV encoded: ${wavBuffer.byteLength} bytes`);
 
-      // Convert to base64
-      const base64Audio = await this.blobToBase64(audioBlob);
-
-      // Send to Gemini for transcription
+      // Send to Gemini
       const prompt = this.buildTranscriptionPrompt();
 
       const result = await this.audioModel.generateContent([
         prompt,
         {
           inlineData: {
-            mimeType: mimeType,
-            data: base64Audio,
+            mimeType: "audio/wav", // ✅ WAV is supported by Gemini
+            data: wavBase64,
           },
         },
       ]);
 
       const text = result.response.text().trim();
+      this.log(`Gemini response: "${text.substring(0, 80)}"`);
 
-      // Check if Gemini says it's just noise/silence
+      // Check for noise/silence
       const isNoise = /no (speech|voice|audio|talking|words)|just (noise|silence|background)|empty|nothing|unintelligible|cannot (hear|understand|make out)|inaudible|no_speech|no clear speech|only (noise|silence|background)|no audible/i.test(text);
 
       if (text && !isNoise && text.length > 1) {
-        // Clean up the transcription (remove quotes, formatting)
         const cleanText = text
-          .replace(/^["']|["']$/g, "") // Remove surrounding quotes
-          .replace(/\[.*?\]/g, "") // Remove bracketed notes like [laughs]
+          .replace(/^["']|["']$/g, "")
+          .replace(/\[.*?\]/g, "")
           .replace(/^(Transcript|Transcription|Text|Speech|User said|They said|He said|She said):\s*/i, "")
           .trim();
 
         if (cleanText) {
+          this.log(`Transcribed: "${cleanText}"`);
           this.onResult?.({
             text: cleanText,
-            confidence: text.length > 10 ? "high" : "medium",
+            confidence: cleanText.length > 10 ? "high" : "medium",
             duration: audioDuration,
             wasSpeech: true,
           });
         }
+      } else {
+        this.log("No speech detected in audio");
       }
-      // If noise/silence — don't send anything (stay quiet)
-
     } catch (error: any) {
-      console.error("[GeminiSTT] Transcription failed:", error?.message || error);
-      // Don't call onError for transcription failures — they're not critical
+      this.log(`Transcription error: ${error?.message || error}`);
+      // Don't call onError for individual failures
     } finally {
       this.isProcessing = false;
     }
   }
 
-  // ===== Build context-aware transcription prompt =====
+  // ===== Build transcription prompt =====
   private buildTranscriptionPrompt(): string {
     const parts = [
       "Transcribe this audio accurately.",
@@ -325,6 +379,7 @@ export class GeminiSTT {
       "If the audio contains only noise, silence, background sounds, or no clear speech, respond with just: NO_SPEECH",
       "Do not add punctuation that wasn't spoken.",
       "Do not add commentary or description.",
+      "Do not add quotation marks around the transcription.",
     ];
 
     if (this.config.language) {
@@ -339,21 +394,17 @@ export class GeminiSTT {
     return parts.join(" ");
   }
 
-  // ===== Convert blob to base64 =====
-  private blobToBase64(blob: Blob): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const dataUrl = reader.result as string;
-        const base64 = dataUrl.split(",")[1];
-        resolve(base64);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
+  // ===== ArrayBuffer → base64 =====
+  private arrayBufferToBase64(buffer: ArrayBuffer): string {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
   }
 
-  // ===== Force process current audio (e.g., on manual stop) =====
+  // ===== Force process current audio =====
   async flush(): Promise<void> {
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
@@ -367,12 +418,12 @@ export class GeminiSTT {
     this.isSpeaking = false;
     this.onSpeakingChange?.(false);
 
-    if (this.chunks.length > 0) {
-      await this.processAudio();
+    if (this.recordingBuffer.length > 0) {
+      await this.processRecording();
     }
   }
 
-  // ===== Stop everything =====
+  // ===== Stop =====
   stop() {
     this.isActive = false;
     this.isSpeaking = false;
@@ -381,34 +432,35 @@ export class GeminiSTT {
       clearInterval(this.vadInterval);
       this.vadInterval = null;
     }
-
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
     }
-
     if (this.maxChunkTimer) {
       clearTimeout(this.maxChunkTimer);
       this.maxChunkTimer = null;
     }
 
-    if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
-      try { this.mediaRecorder.stop(); } catch {}
+    if (this.processor) {
+      this.processor.disconnect();
+      this.processor = null;
     }
-    this.mediaRecorder = null;
-
+    if (this.source) {
+      this.source.disconnect();
+      this.source = null;
+    }
     if (this.audioContext) {
       this.audioContext.close().catch(() => {});
       this.audioContext = null;
     }
-
     if (this.stream) {
       this.stream.getTracks().forEach(t => t.stop());
       this.stream = null;
     }
 
     this.analyser = null;
-    this.chunks = [];
+    this.pcmBuffer = [];
+    this.recordingBuffer = [];
     this.energyHistory = [];
   }
 
@@ -418,5 +470,9 @@ export class GeminiSTT {
 
   get active(): boolean {
     return this.isActive;
+  }
+
+  get debug(): string[] {
+    return this.debugLog;
   }
 }
