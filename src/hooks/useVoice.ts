@@ -1,17 +1,14 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
+import { GeminiSTT, STTResult } from "@/lib/voice/gemini-stt";
 
-// ===== Voice Hook v3 =====
-// Completely rebuilt: always-on mic, silence detection, auto-send
-// 
-// Features:
-// - Continuous speech recognition that stays on
-// - Silence detection: auto-sends after 2s of no speech
-// - Always-on mode: mic never stops, auto-sends each utterance
-// - Proper auto-restart with backoff on errors
-// - Push-to-talk mode: manual start/stop
-// - Auto-speak: reads AI responses aloud
+// ===== Voice Hook v4 =====
+// Replaces browser SpeechRecognition with Gemini-powered transcription
+// Like Wispr Flow: accurate, context-aware, noise-resistant
+//
+// Pipeline: Mic → MediaRecorder → VAD → Gemini STT → text
+// Fallback: If Gemini STT fails, falls back to browser SpeechRecognition
 
 type VoiceMode = "push-to-talk" | "always-on";
 
@@ -22,177 +19,113 @@ interface VoiceCallbacks {
 
 export function useVoice(callbacks?: VoiceCallbacks) {
   const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false); // AI speaking via TTS
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false); // User speaking into mic
   const [transcript, setTranscript] = useState("");
-  const [interimTranscript, setInterimTranscript] = useState("");
   const [supported, setSupported] = useState(false);
   const [mode, setMode] = useState<VoiceMode>("push-to-talk");
+  const [sttMode, setSttMode] = useState<"gemini" | "browser">("gemini");
 
-  // Refs for stable references (avoid stale closures)
-  const recognitionRef = useRef<any>(null);
+  // Refs
+  const sttRef = useRef<GeminiSTT | null>(null);
+  const apiKeyRef = useRef<string | null>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
+  const callbacksRef = useRef<VoiceCallbacks>(callbacks || {});
+  const modeRef = useRef<VoiceMode>("push-to-talk");
+  const isListeningRef = useRef(false);
   const isStoppingRef = useRef(false);
   const autoSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastFinalTranscriptRef = useRef("");
-  const isListeningRef = useRef(false);
-  const modeRef = useRef<VoiceMode>("push-to-talk");
-  const callbacksRef = useRef<VoiceCallbacks>(callbacks || {});
-  const errorCountRef = useRef(0);
-  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTranscriptRef = useRef("");
 
-  // Keep callbacks ref updated
+  // Browser SpeechRecognition fallback refs
+  const browserRecognitionRef = useRef<any>(null);
+  const browserFallbackActive = useRef(false);
+
+  // Keep refs updated
   useEffect(() => {
     callbacksRef.current = callbacks || {};
   }, [callbacks]);
 
-  // Keep mode ref updated
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
 
-  // ===== Initialize SpeechRecognition =====
+  // ===== Initialize =====
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-
-    const hasRecognition = !!SpeechRecognition;
+    const hasMic = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
     const hasSynth = !!window.speechSynthesis;
+    setSupported(hasMic && hasSynth);
 
-    if (hasRecognition && hasSynth) {
-      setSupported(true);
-      createRecognition(SpeechRecognition);
-    }
-
-    // Load voices
+    // Load voices for TTS
     synthRef.current = window.speechSynthesis;
-    const loadVoices = () => {
-      if (synthRef.current) {
-        synthRef.current.getVoices(); // Trigger load
-      }
-    };
+    const loadVoices = () => { synthRef.current?.getVoices(); };
     loadVoices();
     window.speechSynthesis?.addEventListener("voiceschanged", loadVoices);
 
+    // Set up browser SpeechRecognition fallback
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+
+      recognition.onresult = (event: any) => {
+        let final = "";
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const r = event.results[i];
+          if (r.isFinal) final += r[0].transcript;
+          else interim += r[0].transcript;
+        }
+        if (final) {
+          lastTranscriptRef.current = final;
+          setTranscript(final);
+          // Auto-send after 1.5s silence
+          clearAutoSendTimer();
+          startAutoSendTimer(final);
+        } else if (interim) {
+          setTranscript(interim);
+        }
+      };
+
+      recognition.onend = () => {
+        if (modeRef.current === "always-on" && !isStoppingRef.current) {
+          try { recognition.start(); } catch {}
+        } else {
+          isListeningRef.current = false;
+          setIsListening(false);
+        }
+      };
+
+      recognition.onerror = (e: any) => {
+        if (e.error !== "aborted" && e.error !== "no-speech") {
+          console.warn("[BrowserSTT] Error:", e.error);
+        }
+      };
+
+      browserRecognitionRef.current = recognition;
+    }
+
     return () => {
-      destroyRecognition();
+      sttRef.current?.stop();
       synthRef.current?.cancel();
+      try { browserRecognitionRef.current?.abort(); } catch {}
       window.speechSynthesis?.removeEventListener("voiceschanged", loadVoices);
     };
   }, []);
 
-  function createRecognition(SpeechRecognition: any) {
-    destroyRecognition();
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-    recognition.maxAlternatives = 1;
-
-    recognition.onresult = (event: any) => {
-      let finalText = "";
-      let interimText = "";
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          finalText += result[0].transcript;
-        } else {
-          interimText += result[0].transcript;
-        }
-      }
-
-      // Clear silence timer on any speech activity
-      clearAutoSendTimer();
-
-      if (finalText) {
-        lastFinalTranscriptRef.current = finalText;
-        setTranscript(finalText);
-        setInterimTranscript("");
-
-        // Start silence timer — auto-send if no more speech in 2 seconds
-        startAutoSendTimer(finalText);
-      } else if (interimText) {
-        setInterimTranscript(interimText);
-        setTranscript(interimText);
-        callbacksRef.current.onInterimTranscript?.(interimText);
-      }
-    };
-
-    recognition.onerror = (event: any) => {
-      console.log("[Voice] Error:", event.error);
-
-      if (event.error === "aborted") {
-        // We caused this — don't auto-restart
-        return;
-      }
-
-      if (event.error === "no-speech") {
-        // No speech detected — this is normal in always-on mode
-        // Recognition will auto-continue in continuous mode
-        return;
-      }
-
-      if (event.error === "network") {
-        console.warn("[Voice] Network error — will retry");
-        errorCountRef.current++;
-      }
-
-      // For other errors, don't set listening false — let onend handle restart
-      if (event.error !== "no-speech" && event.error !== "aborted") {
-        errorCountRef.current++;
-      }
-    };
-
-    recognition.onend = () => {
-      // Auto-restart in always-on mode (unless we intentionally stopped)
-      if (modeRef.current === "always-on" && !isStoppingRef.current) {
-        const backoff = Math.min(500 * Math.pow(1.5, errorCountRef.current), 5000);
-        restartTimerRef.current = setTimeout(() => {
-          try {
-            if (recognitionRef.current && !isStoppingRef.current) {
-              recognitionRef.current.start();
-            }
-          } catch {
-            // Already running, ignore
-          }
-        }, backoff);
-      } else {
-        isListeningRef.current = false;
-        setIsListening(false);
-      }
-    };
-
-    recognitionRef.current = recognition;
-    errorCountRef.current = 0;
-  }
-
-  function destroyRecognition() {
-    if (restartTimerRef.current) {
-      clearTimeout(restartTimerRef.current);
-      restartTimerRef.current = null;
-    }
-    if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch {}
-      recognitionRef.current = null;
-    }
-  }
-
   // ===== Auto-send timer =====
   function startAutoSendTimer(text: string) {
-    clearAutoSendTimer();
     autoSendTimerRef.current = setTimeout(() => {
-      // User stopped talking — auto-send
       if (text.trim()) {
         callbacksRef.current.onAutoSend?.(text.trim());
-        lastFinalTranscriptRef.current = "";
+        lastTranscriptRef.current = "";
         setTranscript("");
-        setInterimTranscript("");
       }
-    }, 2000); // 2 seconds of silence = auto-send
+    }, 1500);
   }
 
   function clearAutoSendTimer() {
@@ -202,66 +135,151 @@ export function useVoice(callbacks?: VoiceCallbacks) {
     }
   }
 
-  // ===== Public methods =====
-
-  const startListening = useCallback(() => {
-    if (!recognitionRef.current) return;
-    isStoppingRef.current = false;
-    errorCountRef.current = 0;
-
-    clearAutoSendTimer();
-    setTranscript("");
-    setInterimTranscript("");
-    lastFinalTranscriptRef.current = "";
-
-    try {
-      recognitionRef.current.start();
-      isListeningRef.current = true;
-      setIsListening(true);
-    } catch (err: any) {
-      // Already running — stop and restart
-      try { recognitionRef.current.stop(); } catch {}
-      setTimeout(() => {
-        try {
-          recognitionRef.current?.start();
-          isListeningRef.current = true;
-          setIsListening(true);
-        } catch {}
-      }, 300);
+  // ===== Initialize Gemini STT with API key =====
+  const initGeminiSTT = useCallback((apiKey: string) => {
+    apiKeyRef.current = apiKey;
+    if (sttRef.current) {
+      sttRef.current.stop();
     }
   }, []);
 
-  const stopListening = useCallback(() => {
-    if (!recognitionRef.current) return;
+  // ===== Create/Get Gemini STT instance =====
+  function getOrCreateSTT(): GeminiSTT | null {
+    if (!apiKeyRef.current) return null;
+    if (sttRef.current) return sttRef.current;
+
+    const stt = new GeminiSTT({
+      apiKey: apiKeyRef.current,
+      maxChunkDuration: 12000,
+      silenceDuration: 1500,
+    });
+
+    sttRef.current = stt;
+    return stt;
+  }
+
+  // ===== Start listening =====
+  const startListening = useCallback(async () => {
+    if (isListeningRef.current) return;
+    isStoppingRef.current = false;
+    clearAutoSendTimer();
+    setTranscript("");
+    lastTranscriptRef.current = "";
+
+    // Try Gemini STT first
+    const stt = getOrCreateSTT();
+    if (stt) {
+      try {
+        const success = await stt.start(
+          // onResult
+          (result: STTResult) => {
+            if (result.wasSpeech && result.text) {
+              setTranscript(result.text);
+              lastTranscriptRef.current = result.text;
+              // Auto-send immediately after Gemini transcription
+              callbacksRef.current.onAutoSend?.(result.text);
+              setTranscript("");
+              lastTranscriptRef.current = "";
+            }
+          },
+          // onSpeakingChange
+          (speaking: boolean) => {
+            setIsUserSpeaking(speaking);
+            if (speaking) {
+              setTranscript("..."); // Show user we hear them
+            }
+          },
+          // onError
+          (error: Error) => {
+            console.error("[GeminiSTT] Error:", error);
+            // Fall back to browser STT
+            startBrowserFallback();
+          }
+        );
+
+        if (success) {
+          isListeningRef.current = true;
+          setIsListening(true);
+          setSttMode("gemini");
+          return;
+        }
+      } catch (e) {
+        console.warn("[Voice] Gemini STT failed, falling back to browser:", e);
+      }
+    }
+
+    // Fall back to browser SpeechRecognition
+    startBrowserFallback();
+  }, []);
+
+  // ===== Browser STT fallback =====
+  function startBrowserFallback() {
+    if (!browserRecognitionRef.current) return;
+
+    setSttMode("browser");
+    browserFallbackActive.current = true;
+
+    try {
+      browserRecognitionRef.current.start();
+      isListeningRef.current = true;
+      setIsListening(true);
+    } catch {
+      try {
+        browserRecognitionRef.current.stop();
+        setTimeout(() => {
+          try {
+            browserRecognitionRef.current?.start();
+            isListeningRef.current = true;
+            setIsListening(true);
+          } catch {}
+        }, 300);
+      } catch {}
+    }
+  }
+
+  // ===== Stop listening =====
+  const stopListening = useCallback(async () => {
     isStoppingRef.current = true;
     clearAutoSendTimer();
 
-    // If there's pending transcript, send it before stopping
-    const pending = lastFinalTranscriptRef.current || transcript;
-    if (pending.trim()) {
-      callbacksRef.current.onAutoSend?.(pending.trim());
+    // If using Gemini STT
+    if (sttRef.current && sttRef.current.active) {
+      // Flush any pending audio
+      const pending = lastTranscriptRef.current;
+      await sttRef.current.flush();
+      if (pending) {
+        callbacksRef.current.onAutoSend?.(pending);
+      }
+      sttRef.current.stop();
     }
 
-    try { recognitionRef.current.stop(); } catch {}
+    // If using browser STT
+    if (browserRecognitionRef.current && browserFallbackActive.current) {
+      try { browserRecognitionRef.current.stop(); } catch {}
+      browserFallbackActive.current = false;
+      const pending = lastTranscriptRef.current;
+      if (pending) {
+        callbacksRef.current.onAutoSend?.(pending);
+      }
+    }
+
     isListeningRef.current = false;
     setIsListening(false);
+    setIsUserSpeaking(false);
     setTranscript("");
-    setInterimTranscript("");
-    lastFinalTranscriptRef.current = "";
-  }, [transcript]);
+    lastTranscriptRef.current = "";
+  }, []);
 
+  // ===== Speak (TTS) =====
   const speak = useCallback((text: string, personality: string = "chill"): Promise<void> => {
     return new Promise((resolve) => {
       if (!synthRef.current) { resolve(); return; }
-
       synthRef.current.cancel();
 
-      // Clean text for TTS
       const clean = text
         .replace(/[\u{1F000}-\u{1FFFF}]/gu, "")
         .replace(/[\u{2700}-\u{27BF}]/gu, "")
         .replace(/\*\*/g, "")
-        .replace(/__/g, "")
         .replace(/`[^`]+`/g, "")
         .replace(/\.{3}/g, ", ")
         .replace(/\?{2,}/g, "?")
@@ -274,8 +292,6 @@ export function useVoice(callbacks?: VoiceCallbacks) {
       if (!clean) { resolve(); return; }
 
       const utterance = new SpeechSynthesisUtterance(clean);
-
-      // Personality-based voice settings
       const settings: Record<string, { rate: number; pitch: number }> = {
         chill: { rate: 1.0, pitch: 1.0 },
         "drill-sergeant": { rate: 1.1, pitch: 0.85 },
@@ -287,7 +303,6 @@ export function useVoice(callbacks?: VoiceCallbacks) {
       utterance.pitch = s.pitch;
       utterance.volume = 1;
 
-      // Find best voice
       if (synthRef.current) {
         const voices = synthRef.current.getVoices();
         const priorities = [
@@ -308,7 +323,6 @@ export function useVoice(callbacks?: VoiceCallbacks) {
       utterance.onstart = () => setIsSpeaking(true);
       utterance.onend = () => { setIsSpeaking(false); resolve(); };
       utterance.onerror = () => { setIsSpeaking(false); resolve(); };
-
       synthRef.current.speak(utterance);
     });
   }, []);
@@ -320,40 +334,44 @@ export function useVoice(callbacks?: VoiceCallbacks) {
 
   const clearTranscript = useCallback(() => {
     setTranscript("");
-    setInterimTranscript("");
-    lastFinalTranscriptRef.current = "";
+    lastTranscriptRef.current = "";
     clearAutoSendTimer();
   }, []);
 
+  // ===== Always-on mode =====
   const enableAlwaysOn = useCallback((on: boolean) => {
     setMode(on ? "always-on" : "push-to-talk");
     modeRef.current = on ? "always-on" : "push-to-talk";
 
-    if (on && !isListeningRef.current && recognitionRef.current) {
-      // Start listening immediately in always-on mode
-      isStoppingRef.current = false;
-      try {
-        recognitionRef.current.start();
-        isListeningRef.current = true;
-        setIsListening(true);
-      } catch {}
+    if (on && !isListeningRef.current) {
+      startListening();
     } else if (!on && isListeningRef.current) {
       stopListening();
     }
-  }, [stopListening]);
+  }, [startListening, stopListening]);
+
+  // ===== Update context for better transcription =====
+  const updateContext = useCallback((context: string) => {
+    if (sttRef.current) {
+      sttRef.current.setContext(context);
+    }
+  }, []);
 
   return {
     isListening,
     isSpeaking,
+    isUserSpeaking,
     transcript,
-    interimTranscript,
     supported,
     mode,
+    sttMode, // "gemini" or "browser"
+    initGeminiSTT,
     startListening,
     stopListening,
     speak,
     stopSpeaking,
     clearTranscript,
     enableAlwaysOn,
+    updateContext,
   };
 }

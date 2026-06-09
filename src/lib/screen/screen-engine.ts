@@ -1,13 +1,13 @@
-// ===== Screen Engine v2 =====
-// Replaces the broken Gemini Live approach with reliable periodic vision analysis
-// Uses standard @google/generative-ai vision model (gemini-2.0-flash)
+// ===== Screen Engine v3 =====
+// Fixed: video element loading, frame capture reliability, analysis callbacks
 //
 // How it works:
-// 1. Captures screen via getDisplayMedia
-// 2. Every N seconds, captures a frame via canvas
-// 3. Detects if frame changed (base64 comparison)
-// 4. If changed, sends to Gemini vision for analysis
-// 5. Returns structured analysis for trigger system
+// 1. getDisplayMedia → video stream
+// 2. Wait for video to actually load frames (loadeddata event)
+// 3. Periodic canvas capture → base64 JPEG
+// 4. Frame change detection (fingerprint comparison)
+// 5. If changed → Gemini vision analysis
+// 6. Analysis callback fires with structured result
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
@@ -26,9 +26,9 @@ const CONFIG = {
   captureWidth: 800,
   captureHeight: 450,
   jpegQuality: 0.6,
-  liveIntervalMs: 4000,       // Check frame every 4s in live mode
-  periodicIntervalMs: 10000,  // Check frame every 10s in periodic mode
-  maxVisionCallsPerMin: 6,    // Rate limit vision API
+  liveIntervalMs: 4000,
+  periodicIntervalMs: 10000,
+  maxVisionCallsPerMin: 6,
 };
 
 export class ScreenEngine {
@@ -37,29 +37,30 @@ export class ScreenEngine {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
 
-  // Stream state
+  // Stream
   private stream: MediaStream | null = null;
   private videoEl: HTMLVideoElement | null = null;
 
-  // Analysis state
+  // Analysis
   private lastFrameBase64 = "";
   private lastAnalysis: ScreenAnalysis | null = null;
   private isActive = false;
   private mode: "live" | "periodic" = "live";
+  private isAnalyzing = false;
 
   // Timers
   private captureTimer: ReturnType<typeof setInterval> | null = null;
   private visionCallTimes: number[] = [];
 
-  // Callbacks
-  private onAnalysis: ((analysis: ScreenAnalysis, frame: string) => void) | null = null;
-  private onStreamEnd: (() => void) | null = null;
-
-  // Teaching context for vision prompt
+  // Teaching context
   private tool = "";
   private realGoal = "";
   private personality = "chill";
   private recentMessages = "";
+
+  // Callbacks stored as mutable refs (avoids stale closures)
+  private onAnalysisCb: ((analysis: ScreenAnalysis, frame: string) => void) | null = null;
+  private onStreamEndCb: (() => void) | null = null;
 
   constructor(apiKey: string) {
     this.genAI = new GoogleGenerativeAI(apiKey);
@@ -87,6 +88,15 @@ export class ScreenEngine {
     this.recentMessages = messages.slice(-500);
   }
 
+  // ===== Update callbacks (call when they change to avoid stale closures) =====
+  setCallbacks(
+    onAnalysis: (analysis: ScreenAnalysis, frame: string) => void,
+    onStreamEnd?: () => void
+  ) {
+    this.onAnalysisCb = onAnalysis;
+    this.onStreamEndCb = onStreamEnd || null;
+  }
+
   // ===== Start screen capture =====
   async startCapture(
     mode: "live" | "periodic",
@@ -94,10 +104,11 @@ export class ScreenEngine {
     onStreamEnd?: () => void
   ): Promise<boolean> {
     this.mode = mode;
-    this.onAnalysis = onAnalysis;
-    this.onStreamEnd = onStreamEnd || null;
+    this.onAnalysisCb = onAnalysis;
+    this.onStreamEndCb = onStreamEnd || null;
 
     try {
+      // Get screen stream
       this.stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: 1280 },
@@ -107,33 +118,58 @@ export class ScreenEngine {
         audio: false,
       });
 
-      // Create hidden video element
+      // Create video element
       this.videoEl = document.createElement("video");
-      this.videoEl.srcObject = this.stream;
       this.videoEl.muted = true;
       this.videoEl.playsInline = true;
-      await this.videoEl.play();
+      this.videoEl.setAttribute("playsinline", "");
+      this.videoEl.srcObject = this.stream;
 
-      // Handle user stopping via browser bar
+      // CRITICAL: Wait for video to actually load frames
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("Video load timeout"));
+        }, 5000);
+
+        this.videoEl!.addEventListener("loadeddata", () => {
+          clearTimeout(timeout);
+          resolve();
+        }, { once: true });
+
+        this.videoEl!.addEventListener("error", () => {
+          clearTimeout(timeout);
+          reject(new Error("Video load error"));
+        }, { once: true });
+
+        // Start playing
+        this.videoEl!.play().catch(reject);
+      });
+
+      console.log("[ScreenEngine] Video loaded, size:", this.videoEl.videoWidth, "x", this.videoEl.videoHeight);
+
+      // Handle stream end
       this.stream.getVideoTracks()[0].addEventListener("ended", () => {
+        console.log("[ScreenEngine] Stream ended by user");
         this.stop();
-        this.onStreamEnd?.();
+        this.onStreamEndCb?.();
       });
 
       this.isActive = true;
 
-      // Wait for first frame to load
-      await new Promise(r => setTimeout(r, 800));
+      // Capture initial frame after a small delay to ensure rendering
+      await new Promise(r => setTimeout(r, 500));
 
-      // Capture initial frame
       const firstFrame = this.captureFrame();
       if (firstFrame) {
         this.lastFrameBase64 = firstFrame;
-        // Analyze first frame immediately
+        console.log("[ScreenEngine] First frame captured, length:", firstFrame.length);
+        // Analyze first frame
         await this.analyzeFrame(firstFrame);
+      } else {
+        console.warn("[ScreenEngine] Could not capture first frame — video may not be ready");
       }
 
-      // Start periodic capture loop
+      // Start capture loop
       const interval = mode === "live" ? CONFIG.liveIntervalMs : CONFIG.periodicIntervalMs;
       this.startCaptureLoop(interval);
 
@@ -145,65 +181,64 @@ export class ScreenEngine {
     }
   }
 
-  // ===== Capture loop — checks for changes and triggers analysis =====
+  // ===== Capture loop =====
   private startCaptureLoop(intervalMs: number) {
     if (this.captureTimer) clearInterval(this.captureTimer);
 
     this.captureTimer = setInterval(async () => {
-      if (!this.isActive || !this.videoEl) return;
+      if (!this.isActive || !this.videoEl || this.isAnalyzing) return;
 
       const frame = this.captureFrame();
       if (!frame) return;
 
-      // Check if frame changed
       const changed = this.hasFrameChanged(frame);
       this.lastFrameBase64 = frame;
 
-      if (changed) {
-        // Rate limit vision calls
-        if (this.canCallVision()) {
-          await this.analyzeFrame(frame);
-        }
+      if (changed && this.canCallVision()) {
+        await this.analyzeFrame(frame);
       }
     }, intervalMs);
   }
 
-  // ===== Frame change detection (fast, no API call) =====
+  // ===== Frame change detection =====
   private hasFrameChanged(newFrame: string): boolean {
     if (!this.lastFrameBase64) return true;
 
     // Quick length check
     const lenDiff = Math.abs(newFrame.length - this.lastFrameBase64.length);
     const lenRatio = lenDiff / this.lastFrameBase64.length;
-    if (lenRatio < 0.005) {
+    if (lenRatio < 0.003) {
       // Very similar length — check content fingerprints
-      // Compare start, middle, and end chunks
-      const chunkSize = 50;
-      const newStart = newFrame.substring(0, chunkSize);
-      const oldStart = this.lastFrameBase64.substring(0, chunkSize);
-      const newMid = newFrame.substring(newFrame.length / 2, newFrame.length / 2 + chunkSize);
-      const oldMid = this.lastFrameBase64.substring(this.lastFrameBase64.length / 2, this.lastFrameBase64.length / 2 + chunkSize);
-      const newEnd = newFrame.substring(newFrame.length - chunkSize);
-      const oldEnd = this.lastFrameBase64.substring(this.lastFrameBase64.length - chunkSize);
+      const chunkSize = 40;
+      const positions = [
+        [0, chunkSize],
+        [Math.floor(newFrame.length * 0.25), Math.floor(newFrame.length * 0.25) + chunkSize],
+        [Math.floor(newFrame.length * 0.5), Math.floor(newFrame.length * 0.5) + chunkSize],
+        [Math.floor(newFrame.length * 0.75), Math.floor(newFrame.length * 0.75) + chunkSize],
+        [newFrame.length - chunkSize, newFrame.length],
+      ];
 
-      if (newStart === oldStart && newMid === oldMid && newEnd === oldEnd) {
-        return false; // Frames are essentially identical
+      for (const [start, end] of positions) {
+        const newChunk = newFrame.substring(start, end);
+        const oldChunk = this.lastFrameBase64.substring(start, end);
+        if (newChunk !== oldChunk) return true;
       }
+      return false; // All chunks match — no change
     }
-
     return true;
   }
 
-  // ===== Check vision API rate limit =====
+  // ===== Vision rate limit =====
   private canCallVision(): boolean {
     const now = Date.now();
-    // Remove calls older than 60 seconds
     this.visionCallTimes = this.visionCallTimes.filter(t => now - t < 60000);
     return this.visionCallTimes.length < CONFIG.maxVisionCallsPerMin;
   }
 
-  // ===== Analyze a frame with Gemini vision =====
+  // ===== Analyze frame with Gemini vision =====
   private async analyzeFrame(frame: string): Promise<void> {
+    if (this.isAnalyzing) return;
+    this.isAnalyzing = true;
     this.visionCallTimes.push(Date.now());
 
     const prompt = this.buildVisionPrompt();
@@ -223,44 +258,44 @@ export class ScreenEngine {
       const analysis = this.parseAnalysis(text);
 
       this.lastAnalysis = analysis;
-      this.onAnalysis?.(analysis, frame);
+      this.onAnalysisCb?.(analysis, frame);
     } catch (error: any) {
-      console.error("[ScreenEngine] Vision analysis failed:", error?.message || error);
-      // Don't crash — just skip this frame
+      console.error("[ScreenEngine] Vision failed:", error?.message || error);
+    } finally {
+      this.isAnalyzing = false;
     }
   }
 
-  // ===== Build the vision analysis prompt =====
+  // ===== Vision prompt =====
   private buildVisionPrompt(): string {
-    return `You are Kira, an AI learning companion. You are looking at your student's screen.
+    return `You are Kira, an AI learning companion looking at your student's screen.
 
-Student is learning: ${this.tool}
-Their real goal: ${this.realGoal}
-Your personality: ${this.personality}
+Student learning: ${this.tool}
+Real goal: ${this.realGoal}
+Personality: ${this.personality}
 
-Analyze what you see. Respond EXACTLY in this format (no markdown, no backticks):
+Analyze the screenshot. Respond EXACTLY in this format:
 
-APP: what app/website is visible (1-3 words)
-PAGE: what page/section they're on (1-5 words)
-ACTION: what they appear to be doing (1-5 words)
-NOTABLE: anything important visible — errors, warnings, form fields, buttons, data (1 sentence)
-URGENCY: low or medium or high (high = error/mistake visible, medium = progress/action needed, low = just observing)
-SHOULD_COMMENT: yes or no (yes = something worth saying to the student, no = nothing notable)
-COMMENT: if SHOULD_COMMENT is yes, write what you'd say as their friend sitting next to them. Max 2 sentences. Lowercase. Casual. No corporate speak. No "I can see your screen". Just reference things naturally. If no, write nothing.
+APP: what app/website (1-3 words)
+PAGE: what page/section (1-5 words)
+ACTION: what they're doing (1-5 words)
+NOTABLE: anything important visible — errors, form fields, buttons, data, warnings (1 sentence)
+URGENCY: low or medium or high
+SHOULD_COMMENT: yes or no
+COMMENT: if yes, what you'd say as their friend. Max 2 sentences. Lowercase. Casual. No "I can see your screen". Just reference things naturally. If no, write nothing.
 
-Rules for SHOULD_COMMENT:
-- Comment if you see an error, mistake, or wrong value
-- Comment if they moved to a new important page
-- Comment if they seem stuck (same page, nothing happening)
-- Comment if you see something worth celebrating (green checkmark, success message)
-- Do NOT comment if nothing changed or it's just a minor scroll
-- Do NOT comment if screen is just showing the same thing as before
+Comment rules:
+- YES if: error/mistake visible, new important page, stuck (same page), something to celebrate
+- NO if: nothing changed, minor scroll, just observing
+- For errors/wrong values → urgency: high
+- For page changes → urgency: medium
+- For observation → urgency: low
 
-Recent conversation context:
+Recent conversation:
 ${this.recentMessages}`;
   }
 
-  // ===== Parse the structured response =====
+  // ===== Parse structured response =====
   private parseAnalysis(text: string): ScreenAnalysis {
     const lines = text.split("\n").filter(l => l.trim());
     const get = (key: string): string => {
@@ -278,18 +313,24 @@ ${this.recentMessages}`;
       action: get("ACTION"),
       notable: get("NOTABLE"),
       shouldComment: shouldComment === "yes" && comment.length > 0,
-      comment: comment,
+      comment,
       urgency: urgency || "low",
       rawText: text,
     };
   }
 
-  // ===== Capture current frame as base64 =====
+  // ===== Capture frame =====
   captureFrame(): string | null {
-    if (!this.videoEl) return null;
+    if (!this.videoEl) {
+      console.warn("[ScreenEngine] No video element");
+      return null;
+    }
 
     try {
-      if (this.videoEl.videoWidth === 0 || this.videoEl.videoHeight === 0) return null;
+      if (this.videoEl.videoWidth === 0 || this.videoEl.videoHeight === 0) {
+        console.warn("[ScreenEngine] Video has no frames yet");
+        return null;
+      }
 
       this.ctx.drawImage(
         this.videoEl,
@@ -299,21 +340,23 @@ ${this.recentMessages}`;
       );
 
       const dataUrl = this.canvas.toDataURL("image/jpeg", CONFIG.jpegQuality);
-      return dataUrl.split(",")[1]; // Strip data:image/jpeg;base64, prefix
-    } catch {
+      return dataUrl.split(",")[1];
+    } catch (err) {
+      console.error("[ScreenEngine] Frame capture error:", err);
       return null;
     }
   }
 
-  // ===== Get current frame (for sending with user messages) =====
+  // ===== Get current frame for user messages =====
   getCurrentFrame(): string | null {
     if (!this.isActive || !this.videoEl) return null;
     return this.captureFrame();
   }
 
-  // ===== Stop everything =====
+  // ===== Stop =====
   stop() {
     this.isActive = false;
+    this.isAnalyzing = false;
 
     if (this.captureTimer) {
       clearInterval(this.captureTimer);
@@ -335,7 +378,6 @@ ${this.recentMessages}`;
     this.visionCallTimes = [];
   }
 
-  // ===== Status =====
   get running(): boolean {
     return this.isActive && this.stream !== null && this.stream.active;
   }
