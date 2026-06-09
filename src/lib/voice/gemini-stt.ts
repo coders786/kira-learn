@@ -288,7 +288,7 @@ export class GeminiSTT {
       const text = result.response.text().trim();
 
       // Check if Gemini says it's just noise/silence
-      const isNoise = /no (speech|voice|audio|talking|words)|just (noise|silence|background)|empty|nothing|unintelligible|cannot (hear|understand|make out)|inaudible/i.test(text);
+      const isNoise = /no (speech|voice|audio|talking|words)|just (noise|silence|background)|empty|nothing|unintelligible|cannot (hear|understand|make out)|inaudible|no_speech|no clear speech|only (noise|silence|background)|no audible/i.test(text);
 
       if (text && !isNoise && text.length > 1) {
         // Clean up the transcription (remove quotes, formatting)
@@ -328,7 +328,7 @@ export class GeminiSTT {
     ];
 
     if (this.config.language) {
-      parts.push(`The language is likely ${this.config.language}.`);
+      parts.push(`The language is likely ${this.config.language === "en" ? "English" : this.config.language}.`);
     }
 
     if (this.config.context) {
