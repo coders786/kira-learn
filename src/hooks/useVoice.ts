@@ -2,64 +2,105 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 
-interface VoiceState {
-  isListening: boolean;
-  isSpeaking: boolean;
-  transcript: string;
-  error: string | null;
-  supported: boolean;
-}
+// ===== Voice Hook v2 =====
+// Fixed: continuous recognition, proper voice loading, auto-restart
+// Supports "always-on" listening mode
+
+type ListenerMode = "push-to-talk" | "always-on";
 
 export function useVoice() {
-  const [state, setState] = useState<VoiceState>({
-    isListening: false,
-    isSpeaking: false,
-    transcript: "",
-    error: null,
-    supported: typeof window !== "undefined" && !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition) && !!window.speechSynthesis,
-  });
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [supported, setSupported] = useState(false);
+  const [mode, setMode] = useState<ListenerMode>("push-to-talk");
 
   const recognitionRef = useRef<any>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
+  const voicesLoadedRef = useRef(false);
+  const isStoppingRef = useRef(false); // Prevent auto-restart when user manually stops
 
-  // Initialize speech recognition
+  // Initialize
   useEffect(() => {
     if (typeof window === "undefined") return;
 
+    // Check support
     const SpeechRecognition =
       (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
 
-    if (SpeechRecognition) {
+    const hasRecognition = !!SpeechRecognition;
+    const hasSynth = !!window.speechSynthesis;
+
+    if (hasRecognition && hasSynth) {
+      setSupported(true);
+
+      // Create recognition instance
       const recognition = new SpeechRecognition();
-      recognition.continuous = false;
+      recognition.continuous = true;        // DON'T STOP after one sentence
       recognition.interimResults = true;
       recognition.lang = "en-US";
       recognition.maxAlternatives = 1;
 
       recognition.onresult = (event: any) => {
-        const current = event.resultIndex;
-        const transcript = event.results[current][0].transcript;
-        setState((prev) => ({ ...prev, transcript }));
-      };
+        let finalTranscript = "";
+        let interimTranscript = "";
 
-      recognition.onend = () => {
-        setState((prev) => ({ ...prev, isListening: false }));
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          if (result.isFinal) {
+            finalTranscript += result[0].transcript;
+          } else {
+            interimTranscript += result[0].transcript;
+          }
+        }
+
+        // Show interim while typing, final when done
+        if (finalTranscript) {
+          setTranscript(finalTranscript);
+        } else if (interimTranscript) {
+          setTranscript(interimTranscript);
+        }
       };
 
       recognition.onerror = (event: any) => {
-        setState((prev) => ({
-          ...prev,
-          isListening: false,
-          error: event.error,
-        }));
+        console.log("Speech error:", event.error);
+        // Don't set listening to false for "aborted" — that's us stopping it
+        if (event.error !== "aborted") {
+          setIsListening(false);
+        }
+      };
+
+      recognition.onend = () => {
+        // Auto-restart in always-on mode (unless we intentionally stopped)
+        if (mode === "always-on" && !isStoppingRef.current && recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+          } catch {
+            // Already running, that's fine
+          }
+        } else {
+          setIsListening(false);
+        }
       };
 
       recognitionRef.current = recognition;
-      setState((prev) => ({ ...prev, supported: true }));
     }
 
+    // Load voices
     synthRef.current = window.speechSynthesis;
+
+    const loadVoices = () => {
+      if (synthRef.current) {
+        const voices = synthRef.current.getVoices();
+        if (voices.length > 0) {
+          voicesLoadedRef.current = true;
+        }
+      }
+    };
+
+    loadVoices();
+    window.speechSynthesis?.addEventListener("voiceschanged", loadVoices);
 
     return () => {
       if (recognitionRef.current) {
@@ -68,112 +109,114 @@ export function useVoice() {
       if (synthRef.current) {
         synthRef.current.cancel();
       }
+      window.speechSynthesis?.removeEventListener("voiceschanged", loadVoices);
     };
-  }, []);
+  }, [mode]);
 
   const startListening = useCallback(() => {
     if (!recognitionRef.current) return;
+    isStoppingRef.current = false;
 
-    setState((prev) => ({ ...prev, transcript: "", error: null }));
+    setTranscript("");
     try {
       recognitionRef.current.start();
-      setState((prev) => ({ ...prev, isListening: true }));
+      setIsListening(true);
     } catch (err: any) {
-      // Recognition might already be running
-      recognitionRef.current.stop();
+      // Already running — stop and restart
+      try {
+        recognitionRef.current.stop();
+      } catch {}
       setTimeout(() => {
-        recognitionRef.current?.start();
-        setState((prev) => ({ ...prev, isListening: true }));
-      }, 100);
+        try {
+          recognitionRef.current?.start();
+          setIsListening(true);
+        } catch {}
+      }, 200);
     }
   }, []);
 
   const stopListening = useCallback(() => {
     if (!recognitionRef.current) return;
-    recognitionRef.current.stop();
-    setState((prev) => ({ ...prev, isListening: false }));
+    isStoppingRef.current = true;
+    try {
+      recognitionRef.current.stop();
+    } catch {}
+    setIsListening(false);
   }, []);
 
-  // Speak text aloud with a natural voice
   const speak = useCallback(
     (text: string, personality: string = "chill"): Promise<void> => {
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         if (!synthRef.current) {
           resolve();
           return;
         }
 
-        // Cancel any ongoing speech
+        // Cancel current speech
         synthRef.current.cancel();
 
-        // Clean text for speech (remove emoji, special chars)
-        const cleanText = text
-          .replace(/[\u{1F000}-\u{1FFFF}]/gu, "") // Remove emoji
-          .replace(/\.\.\./g, ", ") // Convert ellipsis to pause
-          .replace(/\?{2,}/g, "?") // Multiple question marks
-          .replace(/!{2,}/g, "!") // Multiple exclamation marks
+        // Clean text for TTS
+        const clean = text
+          .replace(/[\u{1F000}-\u{1FFFF}]/gu, "")
+          .replace(/[\u{2700}-\u{27BF}]/gu, "") // Dingbats (✦ etc)
+          .replace(/\.\.\./g, ", ")
+          .replace(/\?{2,}/g, "?")
+          .replace(/!{2,}/g, "!")
+          .replace(/\n/g, ". ")
+          .replace(/[{(\[})\]]/g, "")
           .trim();
 
-        const utterance = new SpeechSynthesisUtterance(cleanText);
-
-        // Adjust voice parameters based on personality
-        switch (personality) {
-          case "chill":
-            utterance.rate = 0.95;
-            utterance.pitch = 1.0;
-            break;
-          case "drill-sergeant":
-            utterance.rate = 1.1;
-            utterance.pitch = 0.9;
-            break;
-          case "patient":
-            utterance.rate = 0.8;
-            utterance.pitch = 1.05;
-            break;
-          case "hype":
-            utterance.rate = 1.15;
-            utterance.pitch = 1.2;
-            break;
+        if (!clean) {
+          resolve();
+          return;
         }
 
-        // Try to find a good voice
-        const voices = synthRef.current.getVoices();
-        const preferredVoices = [
-          "Google US English",
-          "Microsoft Aria",
-          "Samantha",
-          "Alex",
-          "Google UK English Female",
-        ];
+        const utterance = new SpeechSynthesisUtterance(clean);
 
-        for (const voiceName of preferredVoices) {
-          const voice = voices.find((v) => v.name.includes(voiceName));
-          if (voice) {
-            utterance.voice = voice;
-            break;
-          }
-        }
-
-        // Fallback: use first English voice
-        if (!utterance.voice) {
-          const englishVoice = voices.find((v) => v.lang.startsWith("en"));
-          if (englishVoice) {
-            utterance.voice = englishVoice;
-          }
-        }
-
-        utterance.onstart = () => {
-          setState((prev) => ({ ...prev, isSpeaking: true }));
+        // Personality-based voice settings
+        const settings: Record<string, { rate: number; pitch: number }> = {
+          chill: { rate: 1.0, pitch: 1.0 },
+          "drill-sergeant": { rate: 1.1, pitch: 0.85 },
+          patient: { rate: 0.85, pitch: 1.05 },
+          hype: { rate: 1.1, pitch: 1.15 },
         };
+        const s = settings[personality] || settings.chill;
+        utterance.rate = s.rate;
+        utterance.pitch = s.pitch;
+        utterance.volume = 1;
 
+        // Find best available voice
+        if (synthRef.current) {
+          const voices = synthRef.current.getVoices();
+
+          // Priority: natural voices first
+          const priorities = [
+            (v: SpeechSynthesisVoice) => v.name.includes("Google US English") && v.localService,
+            (v: SpeechSynthesisVoice) => v.name.includes("Google US English"),
+            (v: SpeechSynthesisVoice) => v.name.includes("Microsoft Aria"),
+            (v: SpeechSynthesisVoice) => v.name.includes("Samantha"),
+            (v: SpeechSynthesisVoice) => v.name.includes("Google") && v.lang.startsWith("en"),
+            (v: SpeechSynthesisVoice) => v.lang.startsWith("en") && v.localService,
+            (v: SpeechSynthesisVoice) => v.lang.startsWith("en"),
+          ];
+
+          for (const matcher of priorities) {
+            const voice = voices.find(matcher);
+            if (voice) {
+              utterance.voice = voice;
+              break;
+            }
+          }
+        }
+
+        utterance.onstart = () => setIsSpeaking(true);
         utterance.onend = () => {
-          setState((prev) => ({ ...prev, isSpeaking: false }));
+          setIsSpeaking(false);
           resolve();
         };
-
-        utterance.onerror = (event) => {
-          setState((prev) => ({ ...prev, isSpeaking: false }));
-          resolve(); // Don't reject - speech errors are non-critical
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          resolve();
         };
 
         synthRef.current.speak(utterance);
@@ -186,19 +229,32 @@ export function useVoice() {
     if (synthRef.current) {
       synthRef.current.cancel();
     }
-    setState((prev) => ({ ...prev, isSpeaking: false }));
+    setIsSpeaking(false);
   }, []);
 
   const clearTranscript = useCallback(() => {
-    setState((prev) => ({ ...prev, transcript: "" }));
+    setTranscript("");
   }, []);
 
+  // Toggle always-on mode
+  const setAlwaysOn = useCallback((on: boolean) => {
+    setMode(on ? "always-on" : "push-to-talk");
+    if (!on && isListening) {
+      stopListening();
+    }
+  }, [isListening, stopListening]);
+
   return {
-    ...state,
+    isListening,
+    isSpeaking,
+    transcript,
+    supported,
+    mode,
     startListening,
     stopListening,
     speak,
     stopSpeaking,
     clearTranscript,
+    setAlwaysOn,
   };
 }

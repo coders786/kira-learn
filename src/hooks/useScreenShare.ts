@@ -2,150 +2,121 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 
-interface ScreenShareState {
-  isSharing: boolean;
-  stream: MediaStream | null;
-  error: string | null;
-  previewElement: HTMLVideoElement | null;
-}
+// ===== Screen Share Hook v2 =====
+// Fixed: ref forwarding, stream lifecycle, proper video binding
 
 export function useScreenShare() {
-  const [state, setState] = useState<ScreenShareState>({
-    isSharing: false,
-    stream: null,
-    error: null,
-    previewElement: null,
-  });
+  const [isSharing, setIsSharing] = useState(false);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null); // Mutable ref to avoid stale closures
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
-
-  const startSharing = useCallback(async () => {
+  const startSharing = useCallback(async (): Promise<boolean> => {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      // Check if already sharing
+      if (streamRef.current) {
+        return true;
+      }
+
+      const mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          frameRate: { ideal: 1 }, // Low FPS for AI analysis
+          frameRate: { ideal: 2 },
         },
         audio: false,
       });
 
-      // Handle user stopping share via browser UI
-      stream.getVideoTracks()[0].addEventListener("ended", () => {
-        stopSharing();
+      // Store in ref FIRST (avoids stale closure in callbacks)
+      streamRef.current = mediaStream;
+      setStream(mediaStream);
+      setIsSharing(true);
+
+      // Bind to video element AFTER state update
+      // Use requestAnimationFrame to ensure DOM is ready
+      requestAnimationFrame(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = mediaStream;
+          videoRef.current.play().catch(() => {});
+        }
       });
 
-      setState({
-        isSharing: true,
-        stream,
-        error: null,
-        previewElement: videoRef.current,
+      // Handle user stopping via browser bar
+      mediaStream.getVideoTracks()[0].addEventListener("ended", () => {
+        streamRef.current = null;
+        setStream(null);
+        setIsSharing(false);
+        if (videoRef.current) {
+          videoRef.current.srcObject = null;
+        }
       });
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-      }
 
       return true;
     } catch (err: any) {
-      setState((prev) => ({
-        ...prev,
-        error: err.message || "Failed to start screen sharing",
-      }));
+      console.error("Screen share error:", err);
+      streamRef.current = null;
+      setStream(null);
+      setIsSharing(false);
       return false;
     }
   }, []);
 
   const stopSharing = useCallback(() => {
-    if (state.stream) {
-      state.stream.getTracks().forEach((track) => track.stop());
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
     }
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
     }
-    setState({
-      isSharing: false,
-      stream: null,
-      error: null,
-      previewElement: null,
-    });
-  }, [state.stream]);
+    setStream(null);
+    setIsSharing(false);
+  }, []);
 
-  // Capture current frame as base64
   const captureFrame = useCallback((): string | null => {
-    if (!state.stream || !videoRef.current) return null;
+    const video = videoRef.current;
+    if (!video || !streamRef.current) return null;
 
     try {
-      const video = videoRef.current;
-      const canvas = canvasRef.current || document.createElement("canvas");
-      canvas.width = video.videoWidth || 1280;
-      canvas.height = video.videoHeight || 720;
+      // Check video has actual frames
+      if (video.videoWidth === 0 || video.videoHeight === 0) return null;
 
-      if (!canvasRef.current) {
+      let canvas = canvasRef.current;
+      if (!canvas) {
+        canvas = document.createElement("canvas");
         canvasRef.current = canvas;
       }
+
+      canvas.width = Math.min(video.videoWidth, 640); // Downscale for API
+      canvas.height = Math.min(video.videoHeight, 360);
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return null;
 
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      // Compress - convert to JPEG with lower quality for smaller size
-      return canvas.toDataURL("image/jpeg", 0.6).split(",")[1];
+      return canvas.toDataURL("image/jpeg", 0.5).split(",")[1];
     } catch (err) {
       console.error("Frame capture error:", err);
       return null;
     }
-  }, [state.stream]);
-
-  // Auto-capture periodically
-  const startAutoCapture = useCallback(
-    (
-      callback: (frameData: string) => void,
-      intervalMs: number = 10000
-    ) => {
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-      }
-
-      captureIntervalRef.current = setInterval(() => {
-        const frame = captureFrame();
-        if (frame) {
-          callback(frame);
-        }
-      }, intervalMs);
-    },
-    [captureFrame]
-  );
-
-  const stopAutoCapture = useCallback(() => {
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
-    }
   }, []);
 
-  // Cleanup on unmount
+  // Cleanup
   useEffect(() => {
     return () => {
-      if (state.stream) {
-        state.stream.getTracks().forEach((track) => track.stop());
-      }
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
   }, []);
 
   return {
-    ...state,
-    videoRef,
+    isSharing,
+    stream,
+    videoRef, // Pass this directly to <video ref={videoRef}>
     startSharing,
     stopSharing,
     captureFrame,
-    startAutoCapture,
-    stopAutoCapture,
   };
 }
