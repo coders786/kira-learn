@@ -226,7 +226,7 @@ export default function LearnPage() {
   const handleGoalDiscovery = useCallback(async (userContent: string) => {
     if (!orchestrator) return;
 
-    const result = await orchestrator.discoverGoal(messages, userContent);
+    const result = await orchestrator.discoverGoal(messages);
 
     const aiMsg: Message = {
       id: uid(),
