@@ -228,6 +228,56 @@ JSON: {"goal":"...","realGoal":"..."}`
     } catch { return ""; }
   }
 
+  // ===== Generate proactive response (triggered by screen/silence/pattern, NOT user message) =====
+  async generateProactiveResponse(
+    context: ConversationContext,
+    triggerPrompt: string,
+    screenData?: string
+  ): Promise<string> {
+    const systemPrompt = getSystemPrompt(
+      context.user.personality,
+      context.user.goal,
+      context.user.realGoal,
+      context.user.tool
+    );
+
+    // Shorter history for proactive — just last 6 messages for context
+    const recentHistory = this.toHistory(context.messages).slice(-6);
+
+    try {
+      const parts: any[] = [{ text: `You are Kira. ${systemPrompt.split("## YOUR IDENTITY")[1]?.substring(0, 200) || "Be brief, casual, lowercase."}` }];
+
+      const chat = this.chatModel.startChat({
+        history: [
+          {
+            role: "user",
+            parts: [{ text: systemPrompt.substring(0, 800) + "\n\nYou are generating a PROACTIVE message — the student didn't ask anything. Keep it SHORT (1-2 sentences max). Sound natural. Don't be annoying." }],
+          },
+          { role: "model", parts: [{ text: "got it. brief and natural." }] },
+          ...recentHistory,
+        ],
+      });
+
+      let prompt = triggerPrompt;
+      if (screenData) {
+        prompt += "\n\n[SCREEN DATA AVAILABLE — reference what you see naturally]";
+      }
+
+      const result = await Promise.race([
+        chat.sendMessage(prompt),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("TIMEOUT")), 10000)
+        ),
+      ]);
+
+      const text = this.antiYapping(result.response.text());
+      this.trackOpening(text);
+      return text;
+    } catch {
+      return ""; // Proactive messages fail silently — don't bother user
+    }
+  }
+
   // ===== Context Builder (KEPT SHORT — long context kills response quality) =====
   private buildContext(context: ConversationContext, screenData?: string, userMessage?: string): string {
     const parts: string[] = [];
