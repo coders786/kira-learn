@@ -2,149 +2,196 @@
 
 > _"What if someone was sitting next to you while you learned?"_
 
-Not a course. Not a video. Not a tutorial. A presence.
+**Not a course. Not a video. A presence.**
 
-Kira is an AI learning companion that sits next to you while you learn any tool or skill. It watches your screen, talks to you like a friend, and teaches you using the Socratic method — asking questions, making you think, and celebrating your wins.
+Kira is an AI learning companion that sits next to you while you learn any tool or skill. It watches your screen, talks to you like a friend, and teaches using the Socratic method — asking questions, making you think, and celebrating your wins.
+
+🌐 **Live on GitHub:** [coders786/kira-learn](https://github.com/coders786/kira-learn)
+
+---
 
 ## ✨ What makes Kira different
 
-- **Conversational, not courses** — No videos. No slides. Just a real conversation.
-- **Socratic method** — Kira asks YOU questions. Makes you think. That's how you remember.
-- **Screen sharing** — Kira watches your screen and guides you in real-time.
-- **Personality matching** — Pick from 4 teaching personalities: chill, drill sergeant, patient, or hype.
-- **Your examples, not generic ones** — Learning Google Ads for your candle business? Every example is about candles.
-- **Mistake bank** — Track mistakes, learn from them, never repeat them.
-- **Voice-first** — Speak or type. Kira talks back.
-- **Adaptive mood** — Kira matches your energy. Fast when you're in the zone, patient when you're slow.
-- **Daily quests** — One tiny thing per day. Small. Doable. Momentum.
+| Feature | How it works |
+|---|---|
+| **Conversational** | Not courses. Not videos. Just a real conversation. |
+| **Socratic method** | Kira asks YOU questions. Makes you think. That's how you remember. |
+| **Screen sharing** | Watches your screen and guides you in real-time via Gemini Vision. |
+| **Personality matching** | 4 personalities: chill 🌊, drill sergeant 💪, patient 🌿, hype 🔥 |
+| **Your examples** | Learning Google Ads for candles? Every example is about YOUR candles. |
+| **Mistake bank** | Tracks mistakes, teaches from them, you never repeat them. |
+| **Voice-first** | Speak or type. Kira talks back with personality-matched voice. |
+| **Adaptive mood** | Matches your energy — fast when you're in the zone, patient when you're slow. |
+| **Daily quests** | One tiny thing per day. Small. Doable. Momentum. |
+| **Anti-yapping** | Responses are SHORT. 2-4 sentences max. Always. |
+| **Context triggers** | Detects confusion, silence, energy levels and responds proactively. |
+
+---
 
 ## 🏗️ Architecture
 
 ```
 kira-learn/
 ├── src/
-│   ├── app/                    # Next.js App Router
-│   │   ├── page.tsx            # Landing page (the emotional hook)
-│   │   ├── learn/page.tsx      # Main learning interface
-│   │   └── api/                # Backend API routes
-│   │       ├── chat/route.ts   # AI conversation endpoint
-│   │       └── screen/route.ts # Screen analysis endpoint
-│   ├── components/             # UI components
-│   │   └── app/                # App-specific components
-│   ├── hooks/                  # React hooks
-│   │   ├── useConversation.ts  # Conversation state management
-│   │   ├── useScreenShare.ts   # Screen capture & sharing
-│   │   └── useVoice.ts         # Speech-to-text & text-to-speech
-│   └── lib/                    # Core logic
-│       ├── ai/                 # AI orchestration layer
-│       │   ├── orchestrator.ts # Central AI brain
-│       │   └── system-prompts.ts # Personality & teaching prompts
-│       ├── storage/            # Local storage management
-│       └── types.ts            # TypeScript type definitions
+│   ├── app/
+│   │   ├── page.tsx                 # Landing page (the emotional hook)
+│   │   ├── learn/page.tsx           # Main learning interface
+│   │   └── api/
+│   │       ├── chat/route.ts        # AI conversation endpoint (Gemini)
+│   │       └── screen/route.ts      # Screen vision analysis (Gemini)
+│   ├── components/app/
+│   │   ├── Conversation.tsx         # Chat message display
+│   │   ├── PersonalityPicker.tsx    # 4 personality cards
+│   │   ├── ScreenSharePanel.tsx     # Live screen preview
+│   │   ├── MistakeBank.tsx          # Mistake tracking overlay
+│   │   ├── DailyQuest.tsx           # Micro-learning quest
+│   │   └── Sidebar.tsx              # Navigation sidebar
+│   ├── hooks/
+│   │   ├── useConversation.ts       # Conversation state machine
+│   │   ├── useScreenShare.ts        # Screen capture (WebRTC)
+│   │   └── useVoice.ts             # Speech-to-text + text-to-speech
+│   └── lib/
+│       ├── ai/
+│       │   ├── orchestrator.ts      # Central AI brain (Gemini 2.0 Flash)
+│       │   ├── system-prompts.ts    # Personality & Socratic prompts
+│       │   ├── context-triggers.ts  # Behavioral trigger detection
+│       │   ├── teaching-engine.ts   # Topic progression & testing
+│       │   └── engagement.ts        # Morning texts & community
+│       ├── storage/index.ts         # Local-first data persistence
+│       └── types.ts                 # Full TypeScript type system
 ```
+
+---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 - Node.js 18+
-- A Google Gemini API key ([get one here](https://aistudio.google.com/apikey))
+- A Google Gemini API key → [Get one free](https://aistudio.google.com/apikey)
 
-### Installation
+### Install & Run
 
 ```bash
-# Clone the repo
-git clone https://github.com/kira-shin/kira-learn.git
+git clone https://github.com/coders786/kira-learn.git
 cd kira-learn
-
-# Install dependencies
 npm install
-
-# Run the dev server
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) and enter your Gemini API key when prompted.
+Open **http://localhost:3000** → Click "try it free" → Enter your Gemini API key → Start learning.
+
+---
 
 ## 🧠 Core Systems
 
 ### 1. The Conversation Engine
-The heart of Kira. Uses Gemini 2.0 Flash for fast, natural responses. Every message is:
-- **Short** — Max 3-4 sentences. Anti-yapping enforced.
+Uses **Gemini 2.0 Flash** for fast, natural responses.
+
+Every AI message is:
+- **Short** — Max 3-4 sentences. Anti-yapping enforced at code level.
 - **Socratic** — Asks questions instead of lecturing.
-- **Personalized** — Every example relates to YOUR real goal.
-- **Contextual** — Knows your mood, your mistakes, your progress.
+- **Personalized** — Every example ties to YOUR real goal.
+- **Contextual** — Knows your mood, mistakes, progress, and screen state.
+
+The orchestrator injects context into every prompt:
+- Active mistakes to watch for
+- Recent progress observations
+- Detected user mood
+- Current teaching topic
+- Screen share status
 
 ### 2. The Screen Sharing System
-Uses the browser's Screen Capture API + Gemini's vision capabilities:
-- Low-framerate capture (1 FPS) to stay lightweight
-- AI analyzes what's on screen and guides you
-- No data stored — just look, help, forget
+Browser Screen Capture API + Gemini Vision:
+
+- Low-framerate capture (1 FPS base, 15s auto-analysis intervals)
+- AI analyzes what's on screen and guides contextually
+- No data stored — look, help, forget
 - User can stop sharing anytime
+- Inline preview shows exactly what the AI sees
 
 ### 3. The Personality System
-Four distinct teaching personalities:
-| Personality | Style |
-|---|---|
-| 🌊 The Chill One | Casual, jokes, never pushy |
-| 💪 The Drill Sergeant | Hard love, no excuses, actually cares |
-| 🌿 The Patient One | Slow, repeats, never annoyed |
-| 🔥 The Hype One | Celebrates every tiny win |
+Four distinct teaching personalities, each with:
+
+| Personality | Voice Rate | Voice Pitch | Prompt Style |
+|---|---|---|---|
+| 🌊 Chill | 0.95x | 1.0 | Slang, "no worries", jokes |
+| 💪 Drill Sergeant | 1.1x | 0.9 | Direct, "listen", "here's the deal" |
+| 🌿 Patient | 0.8x | 1.05 | Gentle, "take your time", repeats |
+| 🔥 Hype | 1.15x | 1.2 | "YESSS!", celebrations, energy |
 
 Each personality changes:
-- The AI's system prompt
-- The voice synthesis parameters (rate, pitch)
-- The conversation style forever
+- The AI's system prompt (core behavior)
+- The TTS voice parameters (how it sounds)
+- The conversation pattern forever
 
-### 4. The Mistake Bank
+### 4. The Teaching Engine
+Manages what to teach, when to test, and how to celebrate:
+
+- **Tool-specific sequences** for Google Ads, Figma, Shopify
+- **Auto-testing** every 7 exchanges ("explain in your own words...")
+- **Mistake interception** — Stops users before common errors
+- **Win detection** — Celebrates first sales, breakthroughs
+- **Topic progression** — Moves forward when understanding is demonstrated
+
+### 5. The Context Trigger System
+Detects when to proactively respond based on:
+
+| Signal | Response |
+|---|---|
+| 2+ min silence | "you still there? no rush." |
+| 3+ short answers | "want me to explain that again?" |
+| 30+ min session | "want to take a break?" |
+| Screen change | "i see you moved to a new page." |
+| Confusion words | Slow down, simplify |
+| High energy | Speed up, skip basics |
+
+### 6. The Mistake Bank
 Every mistake is caught, categorized, and tracked:
-- Top 5 most common mistakes
-- "Want to spend 10 minutes making sure you never do this again?"
-- Mistakes become teaching moments
 
-### 5. The Mood Detection System
-Kira adapts to your energy level:
-- **In the zone** → Speeds up, skips basics
-- **Normal** → Standard pace
-- **Slow** → More patient, repeats concepts
-- **Tired** → Suggests shorter sessions, offers breaks
+- Top 5 most common mistakes displayed
+- "Want to spend 10 min making sure you never do this again?"
+- Mistakes become teaching moments
+- Resolved mistakes build confidence
+
+---
 
 ## 🛡️ Privacy
 
-- All user data is stored locally in the browser (prototype)
+- All data stored locally in browser (localStorage)
 - API keys never leave your browser
-- Screen data is processed in real-time and never stored
-- No accounts, no tracking, no analytics (in prototype)
+- Screen data processed in real-time, never stored
+- No accounts, no tracking, no analytics
+- Open source — you can verify everything
 
-## 📋 Free vs Pro (Planned)
-
-| Feature | Free | Pro |
-|---|---|---|
-| Sessions per week | 3 | Unlimited |
-| Tools | 1 | All |
-| AI memory | 7 days | Forever |
-| Personality | Default | Pick any |
-| Mistake bank | ❌ | ✅ |
-| Morning texts | ❌ | ✅ |
-| Daily quests | ❌ | ✅ |
-| Community rooms | ❌ | ✅ |
+---
 
 ## 🛣️ Roadmap
 
-- [ ] Persistent cloud storage for user profiles
-- [ ] Multi-model support (Claude, GPT-4, etc.)
-- [ ] Community rooms (20 people, same goal)
-- [ ] Morning text notifications
-- [ ] Mobile-responsive design
-- [ ] More personality customization
-- [ ] Tool-specific teaching modules
-- [ ] Progress analytics (conversational, not charts)
-- [ ] Achievement system (without feeling gamified)
+- [ ] Cloud sync for user profiles across devices
+- [ ] Multi-model support (Claude, GPT-4, Kimi, GLM)
+- [ ] Community rooms (20 people, same goal, real-time)
+- [ ] Morning push notifications (PWA)
+- [ ] Mobile app (React Native)
+- [ ] More tool-specific teaching modules
+- [ ] Learning analytics (conversational, not charts)
+- [ ] Real-time collaborative screen sharing
+- [ ] Tool calling for hands-on actions
+- [ ] Background intent detection (advanced dictation)
+- [ ] Persistent memory across sessions (vector store)
+
+---
 
 ## 💡 The Vision
 
 > _The user outgrows the AI. The AI becomes a memory. A friend who got you there._
 
-The end state isn't a user who uses Kira forever. It's a user who opens the app one day and says "I'm the teacher now." That's success.
+The end state isn't a user who uses Kira forever. It's a user who opens the app one day and the AI says:
+
+**"you tell me. you're the teacher now."**
+
+That's success.
+
+---
 
 ## 📄 License
 
@@ -152,4 +199,6 @@ MIT
 
 ---
 
-Built with Next.js, Gemini AI, and the belief that everyone deserves a teacher who actually sees them.
+Built with **Next.js 15**, **Gemini 2.0 Flash**, **Tailwind CSS**, and the belief that everyone deserves a teacher who actually sees them.
+
+*By Kira Shin*
