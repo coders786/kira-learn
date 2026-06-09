@@ -1,12 +1,14 @@
 /** @type {import('next').NextConfig} */
+const isGitHubPages = process.env.GITHUB_ACTIONS === 'true';
+const repoName = 'kira-learn';
+
 const nextConfig = {
+  output: 'export',
+  trailingSlash: true,
+  basePath: isGitHubPages ? `/${repoName}` : '',
+  assetPrefix: isGitHubPages ? `/${repoName}/` : '',
   images: {
-    domains: [],
-  },
-  experimental: {
-    serverActions: {
-      bodySizeLimit: '10mb',
-    },
+    unoptimized: true,
   },
 };
 

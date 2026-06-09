@@ -14,6 +14,7 @@ import { getSystemPrompt, getScreenAnalysisPrompt } from "./system-prompts";
 
 // ===== AI Orchestrator =====
 // Central brain that manages all AI interactions
+// All calls go directly to Gemini from the client — no server needed
 
 export class AIOrchestrator {
   private genAI: GoogleGenerativeAI;
@@ -28,7 +29,7 @@ export class AIOrchestrator {
         temperature: 0.85,
         topP: 0.95,
         topK: 40,
-        maxOutputTokens: 300, // Keep responses SHORT - anti-yapping
+        maxOutputTokens: 300,
       },
     });
     this.visionModel = this.genAI.getGenerativeModel({
@@ -67,7 +68,7 @@ export class AIOrchestrator {
     // Build screen context if available
     let screenContext = "";
     if (screenData) {
-      screenContext = `\n\n[SCREEN CONTEXT - The user is sharing their screen. Here's what you can see: The user is currently on their ${context.user.tool} interface.]`;
+      screenContext = `\n\n[SCREEN CONTEXT - The user is sharing their screen. You can see their ${context.user.tool} interface. Guide them based on what you can see.]`;
     }
 
     // Build mistake context
@@ -104,7 +105,6 @@ export class AIOrchestrator {
     try {
       const history = this.toGeminiHistory(context.messages);
 
-      // Prepare the message parts
       const parts: Part[] = [{ text: userMessage }];
 
       const chat = this.model.startChat({
@@ -128,18 +128,16 @@ export class AIOrchestrator {
       const result = await chat.sendMessage(parts);
       const response = result.response.text();
 
-      // Post-process: enforce anti-yapping
       return this.antiYapping(response);
     } catch (error: any) {
       console.error("AI generation error:", error);
-      // Fallback responses based on personality
       return this.getFallbackResponse(context.user.personality);
     }
   }
 
   // Analyze screen content
   async analyzeScreen(
-    screenImage: string, // base64
+    screenImage: string,
     tool: string,
     goal: string,
     recentMessages: string
@@ -151,7 +149,7 @@ export class AIOrchestrator {
         prompt,
         {
           inlineData: {
-            mimeType: "image/png",
+            mimeType: "image/jpeg",
             data: screenImage,
           },
         },
@@ -212,7 +210,6 @@ export class AIOrchestrator {
       const result = await chat.sendMessage(lastUserMsg.content);
       const response = result.response.text();
 
-      // Try to extract goals from the conversation
       const extraction = await this.extractGoals(messages);
 
       return {
@@ -254,7 +251,7 @@ Conversation:
 ${conversationText}
 
 Respond in this exact JSON format only:
-{"tool": "what they want to learn", "realGoal": "what they actually want to accomplish"}
+{"goal": "what they want to learn", "realGoal": "what they actually want to accomplish"}
 
 If you can't determine both, respond with null`
       );
@@ -274,10 +271,8 @@ If you can't determine both, respond with null`
 
   // Anti-yapping: ensure responses are SHORT
   private antiYapping(text: string): string {
-    // Remove any trailing fluff
     let cleaned = text.trim();
 
-    // If response is way too long, truncate at the last sentence boundary before 300 chars
     if (cleaned.length > 300) {
       const sentences = cleaned.match(/[^.!?]+[.!?]+/g) || [];
       let result = "";
@@ -292,7 +287,6 @@ If you can't determine both, respond with null`
       }
     }
 
-    // Remove any "As an AI" or "I'm here to help" filler
     cleaned = cleaned.replace(/as an ai[^.]*\.\s*/gi, "");
     cleaned = cleaned.replace(/i'm here to help[^.]*\.\s*/gi, "");
     cleaned = cleaned.replace(/let me know if[^.]*\.\s*/gi, "");
@@ -318,7 +312,6 @@ If you can't determine both, respond with null`
   }
 }
 
-// Helper to import the goal discovery prompt
 function getGoalDiscoveryPromptFromSystemPrompts(): string {
   return `You are Kira, an AI learning companion. Right now you're in the GOAL DISCOVERY phase.
 
