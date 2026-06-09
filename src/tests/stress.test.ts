@@ -799,7 +799,7 @@ console.log("\n🔹 SECTION 4: GEMINI STT\n");
   // TEST 57: Default config values
   {
     assert((stt as any).config.maxChunkDuration === 15000, "Max chunk 15s");
-    assert((stt as any).config.silenceDuration === 1500, "Silence duration 1.5s");
+    assert((stt as any).config.silenceDuration === 1800, "Silence duration 1.8s");
     assert((stt as any).config.language === "en", "Default language en");
   }
 
