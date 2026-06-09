@@ -15,6 +15,7 @@ import {
   getMistakes,
   getProgressNotes,
   getQuests,
+  clearAllData,
 } from "@/lib/storage";
 import {
   PersonalityType,
@@ -51,7 +52,8 @@ export default function LearnPage() {
   const [showMistakeBank, setShowMistakeBank] = useState(false);
   const [showQuest, setShowQuest] = useState(false);
   const [mood, setMood] = useState<MoodType>("normal");
-  const [apiKey, setApiKey] = useState<string>("");
+  const [autoSpeak, setAutoSpeak] = useState(false); // OFF by default — user opts in
+  const [error, setError] = useState<string | null>(null);
   const [orchestrator, setOrchestrator] = useState<AIOrchestrator | null>(null);
 
   const screenShare = useScreenShare();
@@ -60,8 +62,9 @@ export default function LearnPage() {
   const lastUserMsgTime = useRef(Date.now());
   const responseTimes = useRef<number[]>([]);
   const greetingDone = useRef(false);
+  const isSending = useRef(false); // Prevent race conditions
 
-  // Initialize
+  // ===== Initialize =====
   useEffect(() => {
     if (mounted) return;
     setMounted(true);
@@ -71,14 +74,19 @@ export default function LearnPage() {
       router.push("/");
       return;
     }
-    setApiKey(key);
-    setOrchestrator(new AIOrchestrator(key));
+
+    try {
+      const orch = new AIOrchestrator(key);
+      setOrchestrator(orch);
+    } catch (e) {
+      setError("Failed to initialize AI. Check your API key.");
+      return;
+    }
 
     const existingUser = getUserProfile();
     if (existingUser && isOnboarded()) {
       setUser(existingUser);
       setStep("teaching");
-      // Load previous messages
       const prev = getSessionMessages();
       if (prev.length > 0) {
         setMessages(prev);
@@ -86,7 +94,7 @@ export default function LearnPage() {
     }
   }, [mounted, router]);
 
-  // Auto-greeting for new users
+  // ===== Auto-greeting for new users =====
   useEffect(() => {
     if (!mounted || !orchestrator) return;
     if (user || greetingDone.current) return;
@@ -102,10 +110,9 @@ export default function LearnPage() {
     };
     setMessages([greeting]);
     setSessionMessages([greeting]);
-    speakMessage(greeting.content, "chill");
   }, [mounted, orchestrator, user, messages.length]);
 
-  // Scroll to bottom
+  // ===== Scroll to bottom =====
   useEffect(() => {
     const timer = setTimeout(() => {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -113,36 +120,22 @@ export default function LearnPage() {
     return () => clearTimeout(timer);
   }, [messages, isLoading]);
 
-  // Speak AI messages
-  function speakMessage(text: string, personality: string) {
-    if (!voice.supported) return;
-    voice.speak(text, personality);
-  }
-
-  // Detect mood from timing and content
+  // ===== Mood Detection =====
   function detectMood(content: string): MoodType {
     const now = Date.now();
     const elapsed = now - lastUserMsgTime.current;
     responseTimes.current.push(elapsed);
     if (responseTimes.current.length > 8) responseTimes.current.shift();
-
     const avgTime = responseTimes.current.reduce((a, b) => a + b, 0) / responseTimes.current.length;
     const lower = content.toLowerCase();
 
-    const confusionSignals = ["confused", "don't understand", "lost", "what?", "huh", "wait what", "i don't get"];
-    const hasConfusion = confusionSignals.some(s => lower.includes(s));
-    const tiredSignals = ["tired", "brain dead", "overwhelmed", "too much", "break"];
-    const hasTired = tiredSignals.some(s => lower.includes(s));
-    const fastSignals = ["got it", "next", "cool", "yep", "understood", "makes sense"];
-    const hasFast = fastSignals.some(s => lower.includes(s));
-
-    if (hasTired) return "tired";
-    if (hasConfusion) return "slow";
-    if (avgTime < 3000 && hasFast) return "in-the-zone";
+    if (/\b(tired|brain dead|overwhelmed|too much|need a break|exhausted)\b/.test(lower)) return "tired";
+    if (/\b(confused|don't understand|lost|what\?|huh|wait what|i don't get)\b/.test(lower)) return "slow";
+    if (avgTime < 3000 && /\b(got it|next|cool|yep|understood|makes sense|let's go)\b/.test(lower)) return "in-the-zone";
     return "normal";
   }
 
-  // Add message helper
+  // ===== Add Message =====
   const addMessage = useCallback((msg: Message) => {
     setMessages(prev => {
       const updated = [...prev, msg];
@@ -152,59 +145,88 @@ export default function LearnPage() {
     addMsg(msg);
   }, []);
 
-  // ===== SEND MESSAGE (main handler) =====
-  const handleSend = useCallback(async (content: string, isVoice: boolean = false) => {
-    if (!content.trim() || isLoading || !orchestrator) return;
+  // ===== SEND MESSAGE (main handler — with input validation) =====
+  const handleSend = useCallback(async (content: string, isVoiceInput: boolean = false) => {
+    if (!content.trim() || isLoading || !orchestrator || isSending.current) return;
 
+    // Prevent race conditions
+    isSending.current = true;
+
+    const sanitized = orchestrator.sanitizeInput(content);
+
+    // Handle special inputs (gibberish, empty, hostile) with pre-defined responses
+    const specialResponse = orchestrator.getSpecialResponse(sanitized);
+    if (specialResponse) {
+      const userMsg: Message = {
+        id: uid(),
+        role: "user",
+        content: sanitized.clean || content.trim(),
+        timestamp: Date.now(),
+        phase: step as ConversationPhase,
+        isVoice: isVoiceInput,
+      };
+      addMessage(userMsg);
+
+      const aiMsg: Message = {
+        id: uid(),
+        role: "ai",
+        content: specialResponse,
+        timestamp: Date.now(),
+        phase: step as ConversationPhase,
+      };
+      addMessage(aiMsg);
+      if (autoSpeak) voice.speak(specialResponse, user?.personality || "chill");
+      isSending.current = false;
+      return;
+    }
+
+    // Normal flow
     const now = Date.now();
-    const elapsed = now - lastUserMsgTime.current;
-    responseTimes.current.push(elapsed);
+    responseTimes.current.push(now - lastUserMsgTime.current);
     lastUserMsgTime.current = now;
-    const detectedMood = detectMood(content);
+    const detectedMood = detectMood(sanitized.clean);
     setMood(detectedMood);
     setInputText("");
+    setError(null);
 
-    // User message
     const userMsg: Message = {
       id: uid(),
       role: "user",
-      content: content.trim(),
+      content: sanitized.clean,
       timestamp: now,
       phase: step === "teaching" ? "teaching" : "goal-discovery",
-      isVoice,
+      isVoice: isVoiceInput,
     };
     addMessage(userMsg);
     setIsLoading(true);
 
     try {
       if (step === "greeting" || step === "goal-discovery") {
-        await handleGoalDiscovery(content);
+        await handleGoalDiscovery(sanitized.clean);
       } else if (step === "teaching" && user) {
-        await handleTeaching(content, isVoice);
+        await handleTeaching(sanitized.clean, isVoiceInput);
       }
-    } catch (error) {
-      console.error("Message handling error:", error);
+    } catch (err: any) {
+      console.error("Message error:", err);
       const errMsg: Message = {
         id: uid(),
         role: "ai",
-        content: "my bad, something glitched. can you say that again?",
+        content: "my bad, something glitched. can you try saying that again?",
         timestamp: Date.now(),
         phase: step as ConversationPhase,
       };
       addMessage(errMsg);
     } finally {
       setIsLoading(false);
+      isSending.current = false;
     }
-  }, [isLoading, orchestrator, step, user, addMessage]);
+  }, [isLoading, orchestrator, step, user, addMessage, autoSpeak, voice]);
 
-  // ===== GOAL DISCOVERY PHASE =====
+  // ===== Goal Discovery =====
   const handleGoalDiscovery = useCallback(async (userContent: string) => {
     if (!orchestrator) return;
 
-    const result = await orchestrator.discoverGoal(
-      messages,
-      userContent
-    );
+    const result = await orchestrator.discoverGoal(messages, userContent);
 
     const aiMsg: Message = {
       id: uid(),
@@ -214,15 +236,14 @@ export default function LearnPage() {
       phase: "goal-discovery",
     };
     addMessage(aiMsg);
-    speakMessage(result.response, "chill");
+    if (autoSpeak) voice.speak(result.response, "chill");
 
-    // Check if goals were extracted
     if (result.extractedGoal && result.extractedRealGoal) {
       const profile: UserProfile = {
         id: uid(),
         goal: result.extractedGoal,
         realGoal: result.extractedRealGoal,
-        tool: result.extractedGoal.replace(/i want to learn /i, "").trim(),
+        tool: result.extractedGoal.replace(/^(i want to learn |teach me |show me )/i, "").trim() || result.extractedGoal,
         personality: "chill",
         learningPreferences: {
           pace: "normal",
@@ -238,13 +259,12 @@ export default function LearnPage() {
       setUserProfile(profile);
       setStep("personality-pick");
     }
-  }, [orchestrator, messages, addMessage]);
+  }, [orchestrator, messages, addMessage, autoSpeak, voice]);
 
-  // ===== TEACHING PHASE =====
-  const handleTeaching = useCallback(async (userContent: string, isVoice: boolean) => {
+  // ===== Teaching =====
+  const handleTeaching = useCallback(async (userContent: string, isVoiceInput: boolean) => {
     if (!orchestrator || !user) return;
 
-    // Capture screen if sharing
     let screenData: string | undefined;
     if (screenShare.isSharing) {
       screenData = screenShare.captureFrame() || undefined;
@@ -263,11 +283,7 @@ export default function LearnPage() {
       isScreenSharing: screenShare.isSharing,
     };
 
-    const response = await orchestrator.generateResponse(
-      context,
-      userContent,
-      screenData
-    );
+    const response = await orchestrator.generateResponse(context, userContent, screenData);
 
     const aiMsg: Message = {
       id: uid(),
@@ -277,10 +293,10 @@ export default function LearnPage() {
       phase: "teaching",
     };
     addMessage(aiMsg);
-    speakMessage(response, user.personality);
-  }, [orchestrator, user, messages, mood, screenShare, addMessage]);
+    if (autoSpeak) voice.speak(response, user.personality);
+  }, [orchestrator, user, messages, mood, screenShare, addMessage, autoSpeak, voice]);
 
-  // ===== PERSONALITY SELECTION =====
+  // ===== Personality Selection =====
   const handlePersonalitySelect = useCallback((personality: PersonalityType) => {
     if (!user) return;
 
@@ -293,20 +309,22 @@ export default function LearnPage() {
     const msg: Message = {
       id: uid(),
       role: "ai",
-      content: `okay. i'll be ${config?.name}. let's do this.\n\none thing. to actually help you, i need to see your screen. just while we're learning. you can turn it off anytime. i don't save your screen. i just look at it, help you, and forget it. cool?`,
+      content: `okay. i'll be ${config?.name}. let's do this.\n\none thing. to actually help you, i can see your screen while we learn. you can turn it off anytime. i don't save anything. i just look, help, and forget. want to try?`,
       timestamp: Date.now(),
       phase: "screen-permission",
     };
     addMessage(msg);
-    speakMessage(msg.content, personality);
-  }, [user, addMessage]);
+    if (autoSpeak) voice.speak(msg.content, personality);
+  }, [user, addMessage, autoSpeak, voice]);
 
-  // ===== SCREEN PERMISSION =====
+  // ===== Screen Permission =====
   const handleScreenPermission = useCallback(async (accepted: boolean) => {
     if (accepted) {
-      const started = await screenShare.startSharing();
-      if (started) {
-        screenShare.isSharing = true;
+      try {
+        await screenShare.startSharing();
+      } catch (e) {
+        // Screen share failed — continue without it
+        console.error("Screen share failed:", e);
       }
     }
 
@@ -323,7 +341,6 @@ export default function LearnPage() {
     };
     addMessage(userMsg);
 
-    // Start teaching
     if (user && orchestrator) {
       setIsLoading(true);
       try {
@@ -353,16 +370,16 @@ export default function LearnPage() {
           phase: "teaching",
         };
         addMessage(aiMsg);
-        speakMessage(response, user.personality);
+        if (autoSpeak) voice.speak(response, user.personality);
       } catch (e) {
         console.error(e);
       } finally {
         setIsLoading(false);
       }
     }
-  }, [screenShare, user, orchestrator, messages, addMessage]);
+  }, [screenShare, user, orchestrator, messages, addMessage, autoSpeak, voice]);
 
-  // ===== VOICE INPUT =====
+  // ===== Voice Toggle =====
   const handleVoiceToggle = useCallback(() => {
     if (voice.isListening) {
       voice.stopListening();
@@ -376,37 +393,28 @@ export default function LearnPage() {
     }
   }, [voice, handleSend]);
 
-  // ===== SCREEN SHARE TOGGLE =====
+  // ===== Screen Share Toggle =====
   const toggleScreenShare = useCallback(async () => {
     if (screenShare.isSharing) {
       screenShare.stopSharing();
     } else {
-      const started = await screenShare.startSharing();
-      // started is boolean
+      try {
+        await screenShare.startSharing();
+      } catch (e) {
+        console.error("Screen share failed:", e);
+      }
     }
   }, [screenShare]);
 
-  // Auto-capture screen and send for analysis periodically
-  useEffect(() => {
-    if (!screenShare.isSharing || !orchestrator || !user) return;
-
-    screenShare.startAutoCapture(async (frameData) => {
-      // Silently analyze screen - don't add to chat unless relevant
-      try {
-        const analysis = await orchestrator.analyzeScreen(
-          frameData,
-          user.tool,
-          user.realGoal,
-          messages.slice(-5).map(m => m.content).join(" ")
-        );
-        // Store as screen context, don't interrupt conversation
-      } catch (e) {
-        // Silent fail for auto-analysis
-      }
-    }, 15000); // Every 15 seconds
-
-    return () => screenShare.stopAutoCapture();
-  }, [screenShare.isSharing, orchestrator, user]);
+  // ===== Restart / Reset =====
+  const handleReset = useCallback(() => {
+    clearAllData();
+    setUser(null);
+    setMessages([]);
+    setStep("greeting");
+    greetingDone.current = false;
+    setOnboarded(false);
+  }, []);
 
   if (!mounted) return null;
 
@@ -428,42 +436,57 @@ export default function LearnPage() {
         </button>
 
         <div className="flex items-center gap-2">
-          {/* Phase indicator */}
+          {/* Phase */}
           <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-kira-surface border border-kira-border/50">
             <div className={`w-1.5 h-1.5 rounded-full ${
-              step === "teaching" ? "bg-kira-green" :
-              step === "goal-discovery" ? "bg-kira-yellow" :
-              "bg-kira-accent"
+              step === "teaching" ? "bg-kira-green" : step === "goal-discovery" ? "bg-kira-yellow" : "bg-kira-accent"
             } ${step === "teaching" ? "animate-pulse" : ""}`} />
-            <span className="text-[11px] text-kira-textMuted">
-              {step === "teaching" ? "learning" : step.replace("-", " ")}
-            </span>
+            <span className="text-[11px] text-kira-textMuted">{step === "teaching" ? "learning" : step.replace("-", " ")}</span>
           </div>
 
-          {/* Mood indicator */}
+          {/* Mood */}
           {user && (
-            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-kira-surface border border-kira-border/50">
+            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-kira-surface border border-kira-border/50">
               <div className={`w-1.5 h-1.5 rounded-full ${
-                mood === "in-the-zone" ? "bg-kira-green" :
-                mood === "tired" ? "bg-kira-yellow" :
-                mood === "slow" ? "bg-kira-blue" :
-                "bg-kira-textMuted/50"
+                mood === "in-the-zone" ? "bg-kira-green" : mood === "tired" ? "bg-kira-yellow" : mood === "slow" ? "bg-kira-blue" : "bg-kira-textMuted/50"
               }`} />
-              <span className="text-[11px] text-kira-textMuted">
-                {mood === "in-the-zone" ? "in the zone" : mood}
-              </span>
+              <span className="text-[11px] text-kira-textMuted">{mood === "in-the-zone" ? "in the zone" : mood}</span>
             </div>
           )}
 
-          {/* Screen share toggle */}
+          {/* Auto-speak toggle */}
+          <button
+            onClick={() => setAutoSpeak(!autoSpeak)}
+            className={`p-2 rounded-lg transition-all text-xs ${
+              autoSpeak
+                ? "bg-kira-accent/20 text-kira-accent border border-kira-accent/30"
+                : "text-kira-textMuted/40 hover:text-kira-textMuted"
+            }`}
+            title={autoSpeak ? "Auto-speak ON" : "Auto-speak OFF"}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              {autoSpeak ? (
+                <>
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                </>
+              ) : (
+                <>
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                </>
+              )}
+            </svg>
+          </button>
+
+          {/* Screen share */}
           <button
             onClick={toggleScreenShare}
             className={`p-2 rounded-lg transition-all ${
-              isSharing
-                ? "bg-kira-accent/20 text-kira-accent border border-kira-accent/30"
-                : "text-kira-textMuted hover:text-kira-text hover:bg-kira-surfaceLight"
+              isSharing ? "bg-kira-accent/20 text-kira-accent border border-kira-accent/30" : "text-kira-textMuted hover:text-kira-text hover:bg-kira-surfaceLight"
             }`}
-            title={isSharing ? "Stop sharing screen" : "Share your screen"}
+            title={isSharing ? "Stop sharing" : "Share screen"}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
               <rect x="2" y="3" width="20" height="14" rx="2" />
@@ -472,17 +495,15 @@ export default function LearnPage() {
             </svg>
           </button>
 
-          {/* Voice toggle */}
+          {/* Voice */}
           <button
             onClick={handleVoiceToggle}
             className={`p-2 rounded-lg transition-all ${
-              voice.isListening
-                ? "bg-kira-accent/20 text-kira-accent border border-kira-accent/30 pulse-ring relative"
-                : voice.isSpeaking
-                ? "bg-kira-green/10 text-kira-green border border-kira-green/20"
+              voice.isListening ? "bg-kira-accent/20 text-kira-accent border border-kira-accent/30 pulse-ring relative"
+                : voice.isSpeaking ? "bg-kira-green/10 text-kira-green border border-kira-green/20"
                 : "text-kira-textMuted hover:text-kira-text hover:bg-kira-surfaceLight"
             }`}
-            title={voice.isListening ? "Stop listening" : voice.isSpeaking ? "Speaking..." : "Voice input"}
+            title={voice.isListening ? "Stop listening" : "Voice input"}
           >
             {voice.isListening ? (
               <div className="flex items-center gap-0.5">
@@ -502,20 +523,19 @@ export default function LearnPage() {
         </div>
       </header>
 
-      {/* ===== MAIN AREA ===== */}
+      {/* ===== MAIN ===== */}
       <div className="flex-1 flex overflow-hidden min-h-0">
-        {/* Sidebar */}
         {showSidebar && (
           <Sidebar
             user={user}
             isScreenSharing={isSharing}
             onShowMistakes={() => { setShowMistakeBank(true); setShowSidebar(false); }}
             onShowQuest={() => { setShowQuest(true); setShowSidebar(false); }}
+            onReset={handleReset}
             onClose={() => setShowSidebar(false)}
           />
         )}
 
-        {/* Chat area */}
         <div className="flex-1 flex flex-col min-w-0">
           {/* Messages */}
           <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
@@ -525,13 +545,9 @@ export default function LearnPage() {
                   <MessageBubble message={msg} personality={currentPersonality} />
                 </div>
               ))}
-
-              {/* Typing indicator */}
               {isLoading && (
                 <div className="flex items-start gap-3">
-                  <div className="w-8 h-8 rounded-full bg-kira-accent/20 flex items-center justify-center flex-shrink-0">
-                    <span className="text-sm">✦</span>
-                  </div>
+                  <div className="w-8 h-8 rounded-full bg-kira-accent/20 flex items-center justify-center flex-shrink-0"><span className="text-sm">✦</span></div>
                   <div className="bg-kira-surface border border-kira-border/50 rounded-2xl rounded-tl-sm px-4 py-3">
                     <div className="flex items-center gap-1.5">
                       <div className="w-2 h-2 rounded-full bg-kira-accent/60 typing-dot" />
@@ -541,61 +557,42 @@ export default function LearnPage() {
                   </div>
                 </div>
               )}
-
               <div ref={messagesEndRef} />
             </div>
           </div>
 
-          {/* Personality Picker (inline) */}
+          {/* Personality picker */}
           {step === "personality-pick" && (
-            <PersonalityPicker
-              onSelect={handlePersonalitySelect}
-              selected={user?.personality || null}
-            />
+            <PersonalityPicker onSelect={handlePersonalitySelect} selected={user?.personality || null} />
           )}
 
-          {/* Screen Permission (inline) */}
+          {/* Screen permission */}
           {step === "screen-permission" && (
             <div className="border-t border-kira-border/50 bg-kira-surface/50 p-6 animate-fade-up">
               <div className="max-w-2xl mx-auto flex items-center gap-4">
-                <button
-                  onClick={() => handleScreenPermission(true)}
-                  className="flex-1 py-3 bg-kira-accent hover:bg-kira-accentLight text-white rounded-xl transition-all btn-glow font-medium"
-                >
-                  yes, share my screen
-                </button>
-                <button
-                  onClick={() => handleScreenPermission(false)}
-                  className="py-3 px-6 bg-kira-surface border border-kira-border text-kira-textMuted rounded-xl hover:text-kira-text transition-colors"
-                >
-                  not right now
-                </button>
+                <button onClick={() => handleScreenPermission(true)} className="flex-1 py-3 bg-kira-accent hover:bg-kira-accentLight text-white rounded-xl transition-all btn-glow font-medium">yes, share my screen</button>
+                <button onClick={() => handleScreenPermission(false)} className="py-3 px-6 bg-kira-surface border border-kira-border text-kira-textMuted rounded-xl hover:text-kira-text transition-colors">not right now</button>
               </div>
             </div>
           )}
 
-          {/* ===== INPUT AREA ===== */}
+          {/* Error */}
+          {error && (
+            <div className="px-4 py-2 bg-kira-red/10 border-t border-kira-red/20 text-kira-red text-sm text-center">{error}</div>
+          )}
+
+          {/* ===== INPUT ===== */}
           <div className="flex-shrink-0 border-t border-kira-border/50 p-4 glass">
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                if (inputText.trim()) {
-                  handleSend(inputText.trim());
-                }
+                if (inputText.trim()) handleSend(inputText.trim());
               }}
               className="flex items-center gap-3 max-w-2xl mx-auto"
             >
-              {/* Stop speaking button */}
               {voice.isSpeaking && (
-                <button
-                  type="button"
-                  onClick={voice.stopSpeaking}
-                  className="p-2.5 rounded-xl bg-kira-red/10 border border-kira-red/20 text-kira-red hover:bg-kira-red/20 transition-colors flex-shrink-0"
-                  title="Stop speaking"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="6" y="6" width="12" height="12" rx="2" />
-                  </svg>
+                <button type="button" onClick={voice.stopSpeaking} className="p-2.5 rounded-xl bg-kira-red/10 border border-kira-red/20 text-kira-red hover:bg-kira-red/20 transition-colors flex-shrink-0" title="Stop speaking">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
                 </button>
               )}
 
@@ -603,27 +600,17 @@ export default function LearnPage() {
                 type="text"
                 value={voice.isListening ? (voice.transcript || "listening...") : inputText}
                 onChange={(e) => { if (!voice.isListening) setInputText(e.target.value); }}
-                placeholder={
-                  voice.isListening ? "speak now..." :
-                  step === "greeting" ? "what are you trying to figure out?" :
-                  step === "goal-discovery" ? "tell me more..." :
-                  "type your response..."
-                }
+                placeholder={voice.isListening ? "speak now..." : step === "greeting" ? "what are you trying to figure out?" : step === "goal-discovery" ? "tell me more..." : "type your response..."}
                 disabled={isLoading}
                 className={`flex-1 bg-kira-surface border border-kira-border rounded-xl px-4 py-3 text-[15px] text-kira-text placeholder:text-kira-textMuted/40 focus:outline-none focus:border-kira-accent/40 transition-all ${
                   voice.isListening ? "border-kira-accent/40 bg-kira-accent/5" : ""
                 } ${isLoading ? "opacity-50 cursor-not-allowed" : ""}`}
+                maxLength={2000}
               />
 
-              {/* Voice button */}
-              <button
-                type="button"
-                onClick={handleVoiceToggle}
-                disabled={isLoading}
+              <button type="button" onClick={handleVoiceToggle} disabled={isLoading}
                 className={`p-3 rounded-xl transition-all flex-shrink-0 ${
-                  voice.isListening
-                    ? "bg-kira-accent text-white pulse-ring relative"
-                    : "bg-kira-surface border border-kira-border text-kira-textMuted hover:text-kira-text hover:border-kira-accent/30"
+                  voice.isListening ? "bg-kira-accent text-white pulse-ring relative" : "bg-kira-surface border border-kira-border text-kira-textMuted hover:text-kira-text hover:border-kira-accent/30"
                 }`}
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -634,10 +621,7 @@ export default function LearnPage() {
                 </svg>
               </button>
 
-              {/* Send button */}
-              <button
-                type="submit"
-                disabled={isLoading || (!inputText.trim() && !voice.isListening)}
+              <button type="submit" disabled={isLoading || (!inputText.trim() && !voice.isListening)}
                 className="p-3 bg-kira-accent text-white rounded-xl hover:bg-kira-accentLight transition-all btn-glow flex-shrink-0 disabled:opacity-20 disabled:cursor-not-allowed disabled:hover:bg-kira-accent"
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -649,56 +633,37 @@ export default function LearnPage() {
           </div>
         </div>
 
-        {/* Screen share preview */}
         {isSharing && (
-          <ScreenSharePanel
-            videoRef={screenShare.videoRef}
-            onStop={() => screenShare.stopSharing()}
-            onCapture={screenShare.captureFrame}
-          />
+          <ScreenSharePanel videoRef={screenShare.videoRef} onStop={() => screenShare.stopSharing()} onCapture={screenShare.captureFrame} />
         )}
       </div>
 
-      {/* Overlay panels */}
       {showMistakeBank && <MistakeBank onClose={() => setShowMistakeBank(false)} />}
       {showQuest && <DailyQuest onClose={() => setShowQuest(false)} />}
     </div>
   );
 }
 
-// ===== Message Bubble Component =====
+// ===== Message Bubble =====
 function MessageBubble({ message, personality }: { message: Message; personality: string }) {
   const isAI = message.role === "ai";
-
   return (
     <div className={`flex items-start gap-3 ${isAI ? "" : "flex-row-reverse"}`}>
       <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-medium ${
         isAI ? "bg-kira-accent/20 text-kira-accent" : "bg-kira-green/15 text-kira-green"
-      }`}>
-        {isAI ? "✦" : "you"}
-      </div>
-
+      }`}>{isAI ? "✦" : "you"}</div>
       <div className={`max-w-[80%] sm:max-w-[75%] ${
-        isAI
-          ? "bg-kira-surface border border-kira-border/40 rounded-2xl rounded-tl-sm"
-          : "bg-kira-accent/8 border border-kira-accent/15 rounded-2xl rounded-tr-sm"
+        isAI ? "bg-kira-surface border border-kira-border/40 rounded-2xl rounded-tl-sm" : "bg-kira-accent/8 border border-kira-accent/15 rounded-2xl rounded-tr-sm"
       } px-4 py-3`}>
-        <div className="text-[15px] leading-relaxed whitespace-pre-wrap text-kira-text/90">
-          {message.content}
-        </div>
-
+        <div className="text-[15px] leading-relaxed whitespace-pre-wrap text-kira-text/90">{message.content}</div>
         <div className="flex items-center gap-2 mt-2">
           {message.isVoice && (
             <span className="text-[10px] text-kira-textMuted/30 flex items-center gap-0.5">
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-              </svg>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /></svg>
               voice
             </span>
           )}
-          <span className="text-[10px] text-kira-textMuted/25 ml-auto">
-            {new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-          </span>
+          <span className="text-[10px] text-kira-textMuted/25 ml-auto">{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
         </div>
       </div>
     </div>
